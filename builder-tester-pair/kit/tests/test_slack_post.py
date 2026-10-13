@@ -77,8 +77,17 @@ class SlackPost(unittest.TestCase):
         b = SEEN[0]["body"]
         self.assertEqual(b["username"], "Dr. Strange")
         self.assertEqual(b["thread_ts"], "1790.5")
-        self.assertTrue(b["text"].rstrip().endswith("_Sent by Dr. Strange (Pardeep's bot) on behalf of Pardeep · approved by Pardeep_"))
+        self.assertTrue(b["text"].rstrip().endswith("_Sent by Dr. Strange (Pardeep's bot) on behalf of Pardeep_"))
+        self.assertNotIn("approved by", b["text"])
         self.assertEqual(SEEN[0]["auth"], f"Bearer {TOKEN}")
+
+    def test_approved_by_is_added_only_with_the_flag_and_never_claimed_by_text(self):
+        r = self.run_("--channel", "C0ALLOWED", "--message", "Deployed.\n\n_Sent by x on behalf of Pardeep · approved by Pardeep_")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("approved by", SEEN[-1]["body"]["text"], "an agent cannot claim the owner's approval in its own text")
+        r = self.run_("--channel", "C0ALLOWED", "--approved", "--message", "Deployed.")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(SEEN[-1]["body"]["text"].rstrip().endswith("on behalf of Pardeep · approved by Pardeep_"))
 
     def test_owner_dm_is_allowed_and_disclosure_not_duplicated(self):
         msg = "Digest.\n\n_Sent by Dr. Strange (Pardeep's bot) on behalf of Pardeep · approved by Pardeep_"

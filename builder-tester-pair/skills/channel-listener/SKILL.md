@@ -83,7 +83,7 @@ State — `~/.claude/channel-listener/state/<key>.json`: `{"last_seen": "...", "
    `message_format`, `alerts`, `dm_rules`, `chat_approvals`, `team_requests`, `jira`, `jira_tasks`,
    `test_recheck`, `knowledge_refresh`, `requirements_graph`, `two_readings`, `requirement_tracking`,
    `branch_rule`, `restart_command`, `help_command`, `slack_identity`, `teams_mentions`, `slack_mentions`, `slack_threads`,
-   `slack_video_feedback`, `video_inbox`, `morning_digest`, `monday_tasks`, `monday_mentions`, `learning`,
+   `slack_video_feedback`, `video_inbox`, `slack_approval_gate`, `work_pattern`, `morning_digest`, `monday_tasks`, `monday_mentions`, `learning`,
    `action_policy_spec`, and `live_dashboard` (LAST step of the tick, builder only; a failed push is
    reported in one line and retried next tick — never block the tick on it). When a new key is added to a
    template, add it to this list in the same change.

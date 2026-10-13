@@ -11,8 +11,9 @@ name), so an agent can still answer. Rules enforced HERE, because a raw call to 
 
   * only a bot token (xoxb-…) is accepted, never a user token: it can never post as the owner's own account;
   * only to a channel in `slack.watch_channels` or to the owner's DM (`owner.slack_user_id`): no other channel, ever;
-  * the message always ends with the disclosure line `_Sent by <persona> (<owner>'s bot) on behalf of <owner> · approved by <owner>_`
-    (added when missing); text that looks like a secret (token, bearer header, password=…) is refused, nothing is sent;
+  * the message always ends with the disclosure line `_Sent by <persona> (<owner>'s bot) on behalf of <owner>_`; the words
+    `· approved by <owner>` are added only with --approved, which is for a message the owner approved manually (an agent
+    never claims approval itself; such wording in the text is stripped without the flag); text that looks like a secret (token, bearer header, password=…) is refused, nothing is sent;
   * at most `slack.post_limit_per_hour` messages (default 20) per agent per hour, and at most 3000 characters;
   * it prints only the message timestamp. A refusal exits non-zero with the reason, so the agent can fall back to a draft.
 
@@ -74,6 +75,7 @@ def main():
     ap.add_argument("--thread-ts", default="")
     ap.add_argument("--persona", default="")
     ap.add_argument("--tag", action="append", default=[], help="Slack user id to mention (U0123ABCD); repeatable. Puts a real <@ID> mention at the start")
+    ap.add_argument("--approved", action="store_true", help="ONLY after the owner manually approved this exact message in the session: adds '· approved by <owner>'")
     ap.add_argument("--message")
     ap.add_argument("--message-file")
     ap.add_argument("--api", default="https://slack.com/api")
@@ -85,6 +87,8 @@ def main():
     allowed = {str(c.get("id")) for c in (pairconf.get(cfg, "slack.watch_channels") or []) if isinstance(c, dict) and c.get("id")}
     if owner_id:
         allowed.add(owner_id)
+    # `slack.post_channels`: channels the agents may POST to but never read (e.g. a review thread in a team channel)
+    allowed |= {str(c) for c in (pairconf.get(cfg, "slack.post_channels") or [])}
     limit = int(pairconf.get(cfg, "slack.post_limit_per_hour") or 20)
     role = pairconf.role(cfg)
     default_persona = str((pairconf.get(cfg, f"{role}.env") or {}).get("SLACK_BOT_NAME") or "") if isinstance(pairconf.get(cfg, f"{role}.env"), dict) else ""
@@ -117,8 +121,11 @@ def main():
         die("no persona: pass --persona or set <role>.env.SLACK_BOT_NAME", 2)
     if SECRET_RX.search(text):
         die("the message looks like it contains a secret (token, bearer header, password…): refusing, nothing sent", 2)
-    disclosure = f"_Sent by {persona} ({owner}'s bot) on behalf of {owner} · approved by {owner}_"
-    if f"on behalf of {owner}" not in text[-300:] or "approved by" not in text[-300:]:
+    # "approved by <owner>" is a claim only the owner can make: it is added ONLY with --approved (after the owner approved
+    # this exact message in the session); otherwise any such wording the agent wrote is stripped.
+    text = re.sub(rf"\s*[·|,-]?\s*approved by {re.escape(owner)}(?![A-Za-z])", "", text, flags=re.I) if not a.approved else text
+    disclosure = f"_Sent by {persona} ({owner}'s bot) on behalf of {owner}" + (f" · approved by {owner}" if a.approved else "") + "_"
+    if f"on behalf of {owner}" not in text[-300:] or (a.approved and "approved by" not in text[-300:]):
         text = f"{text}\n\n{disclosure}"
     if len(text) > 3000:
         die(f"message is {len(text)} characters, over the 3000 limit: shorten it", 2)
