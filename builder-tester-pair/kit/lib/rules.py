@@ -317,6 +317,30 @@ def _monday_assign(cfg, role, name):
     return f"is assigned to {name} when it carries the label `{label}` in {col}"
 
 
+def _variants(name):
+    """The spellings people really type for one agent name: 'Dr. Strange' -> dr. strange / dr strange / drstrange / dr_strange."""
+    low = re.sub(r"\s+", " ", str(name).strip().lower())
+    out = []
+    for v in (low, low.replace(".", ""), low.replace(".", "").replace(" ", ""), low.replace(".", "").replace(" ", "_"),
+              low.replace(" ", "")):
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def name_match_note(cfg):
+    """One sentence every rule uses so that 'Dr. Strange', 'dr strange', 'DrStrange' and '@dr_strange' are the same name."""
+    bn, tn, _on, _osh = _names(cfg)
+    ex = ", ".join("'" + v + "'" for n in (bn, tn) for v in _variants(n)[:4])
+    return ("names match case-insensitively and ignoring spaces, dots, underscores and a leading '@', so these all count: " + ex)
+
+
+def bot_tag_or(cfg):
+    """' or the bot's own tag <@ID>' when slack.bot_user_id is set: someone tagging the app/bot user counts as asking the builder."""
+    bid = str(pairconf.get(cfg, "slack.bot_user_id") or "")
+    return f" or the bot's own tag <@{bid}> (the app's bot user)" if bid else ""
+
+
 def derived_texts(cfg):
     """The ${derived.*} keys the listener/start templates use."""
     d = {k.split(".", 1)[1]: get(cfg, k) for k in DEFAULTS if k.startswith("listener.")}
@@ -354,6 +378,7 @@ def derived_texts(cfg):
         "monday_owner_id": str(get(cfg, "monday.owner_user_id") or "") or "the owner's Monday user",
         "monday_assign_builder": _monday_assign(cfg, "builder", bn), "monday_assign_tester": _monday_assign(cfg, "tester", tn),
         "slack_mention_tag": ("<@" + str(pairconf.get(cfg, "owner.slack_user_id") or "") + ">") if pairconf.get(cfg, "owner.slack_user_id") else "",
+        "name_match_note": name_match_note(cfg), "bot_tag_or": bot_tag_or(cfg),
         "no_teams_note": ("" if pairconf.get(cfg, "teams.hub_workspace_id") else
                           f"Teams is not configured here, so there is no self-chat: put what {on} must see on the board "
                           f"(`board add need ...`) and say it in your terminal session; never post it on Slack."),

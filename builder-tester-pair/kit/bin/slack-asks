@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""slack-asks — a safety net that does not depend on the agents' judgement: find Slack requests that nobody answered.
+
+  slack-asks [--days 3] [--grace-min 45] [--board] [--json]
+  slack-asks --check
+
+It reads each watched channel (`slack.watch_channels`) with the pair's BOT token (read only: conversations.history/replies; the same
+token file slack-fetch uses), and lists every ASK, i.e. a message by a person that tags the owner or the bot user or names the builder
+or tester (any spelling), plus every person's reply inside a thread the bot took part in, that
+
+  * is older than --grace-min minutes (default 45) and newer than --days days (default 3), and
+  * has NO later reply from the bot in its thread, and
+  * is not referenced by any hand-over (the message ts appears in a file under <ledger>/handoffs/), and
+  * is not already marked by the owner or an agent with a reaction ✅ / 👀 from the bot.
+
+With --board it adds ONE board need per unanswered ask (never twice: state in ~/.cache/slack-asks.json) so it shows on the dashboard's
+"Needs you". Nothing is ever posted to Slack. Exit 0 = nothing unanswered, 1 = some unanswered, 2 = use, 3 = no token, 4 = Slack refused.
+It prints message ids, ages and the first 100 characters of an ask; never a token."""
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "lib"))
+import pairconf  # noqa: E402
+import rules  # noqa: E402
+
+
+def die(msg, code):
+    print(f"slack-asks: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def token():
+    p = os.path.expanduser(os.environ.get("SLACK_FETCH_TOKEN_FILE") or "~/.config/slack-fetch/token")
+    try:
+        if os.stat(p).st_mode & 0o077:
+            die(f"token file {p} is readable by others: chmod 600 it", 3)
+        return open(p).read().strip() or None
+    except OSError:
+        return None
+
+
+class ChannelUnreadable(Exception):
+    pass
+
+
+def api(base, method, params, tok):
+    req = urllib.request.Request(f"{base.rstrip('/')}/{method}?{urllib.parse.urlencode(params)}", headers={"Authorization": f"Bearer {tok}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        die(f"could not reach Slack for {method}: {type(e).__name__}", 4)
+    if not d.get("ok"):
+        if d.get("error") in ("ratelimited",):
+            time.sleep(2)
+            return api(base, method, params, tok)
+        if d.get("error") in ("not_in_channel", "channel_not_found", "missing_scope"):
+            raise ChannelUnreadable(d["error"])         # this one channel cannot be read by the bot: skip it, say so, carry on
+        die(f"Slack refused {method}: {d.get('error', 'unknown')}", 4)
+    return d
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--days", type=float, default=3)
+    ap.add_argument("--grace-min", type=float, default=45)
+    ap.add_argument("--board", action="store_true")
+    ap.add_argument("--max-new", type=int, default=3, help="at most this many NEW board needs per run (default 3)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--api", default="https://slack.com/api")
+    a = ap.parse_args()
+    cfg = pairconf.load()
+    tok = token()
+    chans = [c for c in (pairconf.get(cfg, "slack.watch_channels") or []) if isinstance(c, dict) and c.get("id")]
+    if a.check:
+        print(f"token configured: {'yes' if tok else 'no'}; watched channels: {len(chans)}")
+        sys.exit(0 if tok else 3)
+    if not tok:
+        die("no Slack token configured", 3)
+    owner_id = str(pairconf.get(cfg, "owner.slack_user_id") or "")
+    bot_id_cfg = str(pairconf.get(cfg, "slack.bot_user_id") or "")
+    bn, tn, on, _osh = rules._names(cfg)
+    name_rx = re.compile(r"(?<![a-z0-9])(" + "|".join(re.escape(v) for n in (bn, tn) for v in rules._variants(n)) + r")(?![a-z0-9])", re.I)
+    who = api(a.api, "auth.test", {}, tok)
+    bot_id = who.get("user_id") or bot_id_cfg
+    ledger = pairconf.ledger_dir(cfg)
+    handed, files = "", []
+    for f in pathlib.Path(ledger, "handoffs").glob("ho-*.json"):
+        try:
+            txt = f.read_text(errors="replace")
+            handed += txt
+            files.append((f.stat().st_mtime, txt))
+        except OSError:
+            pass
+
+    def thread_handled_at(parent_ts):
+        """Latest time a hand-over that names this thread (its ts or its permalink form) was written, else 0."""
+        keys = (parent_ts, "p" + parent_ts.replace(".", ""))
+        return max([mt for mt, txt in files if any(k in txt for k in keys)] or [0])
+    now = time.time()
+    oldest = now - a.days * 86400
+
+    def is_ask(m):
+        if m.get("user") == bot_id or m.get("bot_id") or m.get("subtype") in ("channel_join", "channel_leave", "bot_message"):
+            return False
+        t = m.get("text") or ""
+        if t.startswith("[bot") or re.search(r"sent by [^\n]{0,60}on behalf of", t, re.I):
+            return False
+        return (f"<@{owner_id}" in t) or (bot_id and f"<@{bot_id}" in t) or bool(name_rx.search(t.replace("_", " ")))
+
+    unanswered = []
+    skipped = []
+    for ch in chans:
+        try:
+            hist = api(a.api, "conversations.history", {"channel": ch["id"], "oldest": f"{oldest:.6f}", "limit": "200"}, tok).get("messages", [])
+        except ChannelUnreadable as e:
+            skipped.append(f"{ch.get('name') or ch['id']} ({e})")
+            continue
+        for m in hist:
+            ts = m.get("ts", "0")
+            thread = None
+            if int(m.get("reply_count") or 0) > 0:
+                try:
+                    thread = api(a.api, "conversations.replies", {"channel": ch["id"], "ts": ts, "limit": "200"}, tok).get("messages", [])
+                except ChannelUnreadable:
+                    thread = None
+            members = thread or [m]
+            bot_in_thread = any(x.get("user") == bot_id for x in members)
+            parent_is_ask = is_ask(m)
+            for i, x in enumerate(members):
+                if i == 0:                      # the parent: an ask only if it tags or names the agents
+                    x_ask = parent_is_ask
+                else:                           # a reply by a person in a thread the bot is part of (or that began as an ask)
+                    x_ask = ((bot_in_thread or parent_is_ask) and x.get("user") not in (None, bot_id) and not x.get("bot_id")
+                             and not (x.get("text") or "").startswith("[bot"))
+                if not x_ask:
+                    continue
+                xts = float(x.get("ts", "0"))
+                if xts < oldest or now - xts < a.grace_min * 60:
+                    continue
+                answered = any(y.get("user") == bot_id and float(y.get("ts", "0")) > xts for y in members)
+                reacted = any(bot_id in (r.get("users") or []) for r in (x.get("reactions") or []))
+                snippet = re.sub(r"\s+", " ", (x.get("text") or "")).strip()[:45]
+                quoted = len(snippet) >= 25 and snippet in re.sub(r"\s+", " ", handed)
+                if answered or reacted or x.get("ts") in handed or quoted or xts < thread_handled_at(ts):
+                    continue
+                unanswered.append({"channel": ch.get("name") or ch["id"], "channel_id": ch["id"], "ts": x["ts"], "thread_ts": ts,
+                                   "age_min": int((now - xts) / 60), "author": x.get("user"), "text": re.sub(r"\s+", " ", x.get("text") or "")[:100]})
+    state_p = pathlib.Path(os.path.expanduser("~/.cache/slack-asks.json"))
+    try:
+        flagged = set(json.loads(state_p.read_text()))
+    except (OSError, ValueError):
+        flagged = set()
+    new_flags = []
+    if a.board:
+        board = pathlib.Path(__file__).resolve().parent / "board"
+        for u in unanswered:
+            if u["ts"] in flagged:
+                continue
+            if len(new_flags) >= a.max_new:
+                break
+            title = f"Slack request unanswered for {u['age_min'] // 60}h{u['age_min'] % 60:02d}m in {u['channel']}: {u['text'][:70]}"
+            why = f"Message {u['ts']} (thread {u['thread_ts']}) tags or names the agents, no agent replied and no hand-over mentions it. A safety-net check found it."
+            how = "Open the thread in Slack, or tell the builder: look at this message and answer or forward it."
+            r = subprocess.run([sys.executable, str(board), "add", "need", "--title", title, "--why", why, "--how", how], capture_output=True, text=True)
+            if r.returncode == 0:
+                new_flags.append(u["ts"])
+        state_p.parent.mkdir(parents=True, exist_ok=True)
+        state_p.write_text(json.dumps(sorted(flagged | set(new_flags))))
+    if a.json:
+        print(json.dumps(unanswered, indent=1))
+    else:
+        for u in unanswered:
+            print(f"UNANSWERED {u['channel']} ts={u['ts']} age={u['age_min']}m by={u['author']}: {u['text']}")
+        print(f"{len(unanswered)} unanswered ask(s)" + (f", {len(new_flags)} new board need(s)" if a.board else ""))
+        if skipped:
+            print("not readable by the bot (invite the app there to cover it): " + ", ".join(skipped))
+    sys.exit(1 if unanswered else 0)
+
+
+if __name__ == "__main__":
+    main()

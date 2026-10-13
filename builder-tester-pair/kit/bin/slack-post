@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""slack-post — send ONE Slack message as the pair's bot (with a persona name), with the guard rails built in.
+
+  slack-post --channel C0123ABCD [--thread-ts 1791.0001] [--persona "Dr. Strange"] (--message TEXT | --message-file FILE)
+  slack-post ... --tag U0123ABCD   # a real @mention of that person (user id from the message you answer)
+  slack-post --check                       # token configured? allowed channels? posts left this hour? (never prints the token)
+
+Why this exists: the team's bot relay only accepts personas it has registered. This posts through the Slack API with the
+app's BOT token (the same file slack-fetch uses; `chat:write` + `chat:write.customize` let the message carry the persona
+name), so an agent can still answer. Rules enforced HERE, because a raw call to chat.postMessage bypasses the disclosure hook:
+
+  * only a bot token (xoxb-…) is accepted, never a user token: it can never post as the owner's own account;
+  * only to a channel in `slack.watch_channels` or to the owner's DM (`owner.slack_user_id`): no other channel, ever;
+  * the message always ends with the disclosure line `_Sent by <persona> (<owner>'s bot) on behalf of <owner> · approved by <owner>_`
+    (added when missing); text that looks like a secret (token, bearer header, password=…) is refused, nothing is sent;
+  * at most `slack.post_limit_per_hour` messages (default 20) per agent per hour, and at most 3000 characters;
+  * it prints only the message timestamp. A refusal exits non-zero with the reason, so the agent can fall back to a draft.
+
+Exit codes: 0 sent · 2 bad use / refused by a local rule · 3 no token · 4 Slack refused."""
+import argparse
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "lib"))
+import pairconf  # noqa: E402
+
+SECRET_RX = re.compile(r"(xox[abprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|Bearer\s+[A-Za-z0-9._~+/=-]{20,}|"
+                       r"(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{6,}|-----BEGIN [A-Z ]*PRIVATE KEY)", re.I)
+
+
+def die(msg, code):
+    print(f"slack-post: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def token_path():
+    return os.path.expanduser(os.environ.get("SLACK_FETCH_TOKEN_FILE") or "~/.config/slack-fetch/token")
+
+
+def read_token():
+    p = token_path()
+    try:
+        mode = os.stat(p).st_mode
+        tok = open(p).read().strip()
+    except OSError:
+        return None
+    if mode & 0o077:
+        die(f"token file {p} is readable by others: chmod 600 it (the owner's step)", 3)
+    return tok or None
+
+
+def state_file():
+    return pathlib.Path(os.path.expanduser("~/.cache/slack-post.json"))
+
+
+def posts_this_hour():
+    try:
+        d = json.loads(state_file().read_text())
+    except (OSError, ValueError):
+        d = []
+    now = time.time()
+    return [t for t in d if now - t < 3600]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--channel")
+    ap.add_argument("--thread-ts", default="")
+    ap.add_argument("--persona", default="")
+    ap.add_argument("--tag", action="append", default=[], help="Slack user id to mention (U0123ABCD); repeatable. Puts a real <@ID> mention at the start")
+    ap.add_argument("--message")
+    ap.add_argument("--message-file")
+    ap.add_argument("--api", default="https://slack.com/api")
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+    cfg = pairconf.load()
+    owner = str(pairconf.get(cfg, "owner.name") or "the owner")
+    owner_id = str(pairconf.get(cfg, "owner.slack_user_id") or "")
+    allowed = {str(c.get("id")) for c in (pairconf.get(cfg, "slack.watch_channels") or []) if isinstance(c, dict) and c.get("id")}
+    if owner_id:
+        allowed.add(owner_id)
+    limit = int(pairconf.get(cfg, "slack.post_limit_per_hour") or 20)
+    role = pairconf.role(cfg)
+    default_persona = str((pairconf.get(cfg, f"{role}.env") or {}).get("SLACK_BOT_NAME") or "") if isinstance(pairconf.get(cfg, f"{role}.env"), dict) else ""
+    tok = read_token()
+    if a.check:
+        left = max(0, limit - len(posts_this_hour()))
+        print(f"token configured: {'yes' if tok else 'no'}; bot token: {'yes' if (tok or '').startswith('xoxb-') else 'no'}; "
+              f"allowed targets: {len(allowed)}; posts left this hour: {left}/{limit}; default persona: {default_persona or '(none)'}")
+        sys.exit(0 if tok else 3)
+    if not a.channel or not (a.message or a.message_file):
+        die("need --channel and --message or --message-file", 2)
+    if not tok:
+        die("no Slack token configured (the owner runs slack-fetch-setup.sh)", 3)
+    if not tok.startswith("xoxb-"):
+        die("the saved token is not a BOT token (xoxb-…): refusing, so nothing can ever post as the owner's own account", 2)
+    if a.channel not in allowed:
+        die(f"{a.channel} is not one of this pair's watched channels or the owner's DM: refusing", 2)
+    text = a.message if a.message is not None else pathlib.Path(a.message_file).read_text()
+    text = text.strip()
+    if not text:
+        die("empty message", 2)
+    for u in a.tag:
+        if not re.fullmatch(r"[UW][A-Z0-9]{6,}", u):
+            die(f"--tag needs a Slack user id like U0123ABCD, got {u!r}", 2)
+    mentions = " ".join(f"<@{u}>" for u in a.tag if f"<@{u}>" not in text)
+    if mentions:
+        text = f"{mentions} {text}"
+    persona = a.persona or default_persona
+    if not persona:
+        die("no persona: pass --persona or set <role>.env.SLACK_BOT_NAME", 2)
+    if SECRET_RX.search(text):
+        die("the message looks like it contains a secret (token, bearer header, password…): refusing, nothing sent", 2)
+    disclosure = f"_Sent by {persona} ({owner}'s bot) on behalf of {owner} · approved by {owner}_"
+    if f"on behalf of {owner}" not in text[-300:] or "approved by" not in text[-300:]:
+        text = f"{text}\n\n{disclosure}"
+    if len(text) > 3000:
+        die(f"message is {len(text)} characters, over the 3000 limit: shorten it", 2)
+    recent = posts_this_hour()
+    if len(recent) >= limit:
+        die(f"{len(recent)} posts in the last hour: at the limit of {limit}, wait or tell {owner}", 2)
+
+    body = {"channel": a.channel, "text": text, "username": persona, "unfurl_links": False, "unfurl_media": False}
+    if a.thread_ts:
+        body["thread_ts"] = a.thread_ts
+    req = urllib.request.Request(f"{a.api.rstrip('/')}/chat.postMessage", data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        die(f"could not reach Slack: {type(e).__name__}", 4)
+    if not resp.get("ok"):
+        die(f"Slack refused: {resp.get('error', 'unknown')} (not_in_channel = invite the app; missing_scope = chat:write / chat:write.customize)", 4)
+    state_file().parent.mkdir(parents=True, exist_ok=True)
+    state_file().write_text(json.dumps(recent + [time.time()]))
+    print(f"sent: channel={resp.get('channel', a.channel)} ts={resp.get('ts', '?')}")
+
+
+if __name__ == "__main__":
+    main()

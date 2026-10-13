@@ -56,9 +56,17 @@ for CFG in "$PAIRS_DIR"/*/pair.yaml; do
       stop)    stop_one ;;
       start)   start_one ;;
       restart) stop_one; [ "$DRY" = 1 ] || sleep 2; start_one ;;
-      status)  a=down; w=down; up "$user" "$home" "$name" && a=UP; up "$user" "$home" "watchdog-$name" && w=UP
-               ROWS+=("$(printf '%-12s %-9s %-8s %-8s agent=%-4s watchdog=%s' "$name" "$role" "$pair" "$user" "$a" "$w")")
-               [ "$a" = UP ] && [ "$w" = UP ] || PROBLEMS=$((PROBLEMS+1)) ;;
+      status)  a=down; w=down; l=-; up "$user" "$home" "$name" && a=UP; up "$user" "$home" "watchdog-$name" && w=UP
+               # A session can be UP while the agent inside does nothing: its Claude login expired (the screen says
+               # "Login expired · Please run /login"). A watchdog restart cannot fix that, only the owner's /login can.
+               if [ "$a" = UP ]; then
+                 if as_user "$user" "$home" tmux capture-pane -p -t "$name" -S -40 2>/dev/null | tail -n 25 \
+                      | grep -qiE 'login expired|please run /login|invalid api key|oauth token has expired|not logged in'; then
+                   l=EXPIRED; else l=ok; fi
+               fi
+               ROWS+=("$(printf '%-12s %-9s %-8s %-8s agent=%-4s watchdog=%-4s login=%s' "$name" "$role" "$pair" "$user" "$a" "$w" "$l")")
+               [ "$a" = UP ] && [ "$w" = UP ] && [ "$l" != EXPIRED ] || PROBLEMS=$((PROBLEMS+1))
+               [ "$l" != EXPIRED ] || echo "ACTION: $name's Claude login expired. As the owner: tmux attach -t $name (as $user), run /login, then Ctrl+B D" >&2 ;;
     esac
   done
   # The pair's Argus executors / test fronts (`argus.processes` in pair.yaml): plain background processes with a pid file,
@@ -94,7 +102,7 @@ for p in v:
 done
 if [ "$CMD" = status ]; then
   printf '%s\n' "${ROWS[@]}"
-  [ "$PROBLEMS" = 0 ] && echo "all up" || echo "$PROBLEMS agent(s) not fully up -> agents.sh start"
+  [ "$PROBLEMS" = 0 ] && echo "all up" || echo "$PROBLEMS agent(s) not fully up -> agents.sh start (an expired login needs the owner's /login, see ACTION above)"
 fi
 [ "$CMD" = start ] || [ "$CMD" = restart ] && [ "$DRY" = 0 ] && echo "started; check with: agents.sh status"
 exit 0

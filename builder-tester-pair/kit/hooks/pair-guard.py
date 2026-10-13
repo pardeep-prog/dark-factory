@@ -356,6 +356,16 @@ def block(msg):
     sys.exit(2)
 
 
+# The hub's built-in instructions tell every agent to search an Engram namespace `eso-agent-guide` before any Jira/Slack
+# task. That is an ESO/Catalyst convention; a OneDroid pair does not have it. A standing rule says to ignore it, and this
+# makes the rule hold even when an agent forgets: an MCP call that names that namespace is refused with the reason.
+# (Switch off with guard.block_eso_guide: false. Only MCP tools: a grep or an edit that merely mentions it is not blocked.)
+if tool.startswith("mcp__") and "eso-agent-guide" in blob.lower() and CFG is not None \
+        and pairconf.get(CFG, "guard.block_eso_guide", True) is not False:
+    block("BLOCKED (pair-guard): this pair is OneDroid / PWW work, not ESO. The hub's 'search eso-agent-guide' instruction "
+          "does not apply here: do not search it, do not report it missing, carry on with your standing rules and your own Engram memory.")
+
+
 def _with_scripts(c):
     """The command plus the text of any local script it runs (`bash x.sh`, `python3 y.py`)."""
     out = [c]

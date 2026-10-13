@@ -27,7 +27,9 @@ STALL_COOLDOWN_MIN=120
 # HOME and PAIR_CONFIG are passed explicitly: tmux starts commands from the tmux server's environment, not ours, and a
 # workspace can hold several agents (each with its own HOME, see agent-home.sh) that must never read each other's pair.yaml.
 UMASK_PFX=""; [ -n "$(PC get paths.share_group)" ] && UMASK_PFX="umask 002; "   # builder+tester as 2 users in one workspace
-printf -v LAUNCH '%sHOME=%q PAIR_CONFIG=%q PAIR_AGENT_SESSION=%q claude --permission-mode auto %q; exec bash' "$UMASK_PFX" "$HOME" "$(PC path)" "$NAME" "$CMD"
+PMODE="$(PC get "$ROLE.permission_mode")"; PMODE="${PMODE:-auto}"     # same setting as start-agent.sh
+case "$PMODE" in auto|bypassPermissions|acceptEdits|default|plan) ;; *) PMODE=auto ;; esac
+printf -v LAUNCH '%sHOME=%q PAIR_CONFIG=%q PAIR_AGENT_SESSION=%q claude --permission-mode %q %q; exec bash' "$UMASK_PFX" "$HOME" "$(PC path)" "$NAME" "$PMODE" "$CMD"
 LOG="$HOME/.cache/agent-watchdog.log"; mkdir -p "$(dirname "$LOG")"
 STAMP="$HOME/.cache/agent-watchdog.last-refresh"
 LAST_STALL="$HOME/.cache/agent-watchdog.last-stall-refresh"
@@ -54,12 +56,73 @@ check_restart_request() {
   if tmux has-session -t "$NAME" 2>/dev/null; then log "restart requested from chat ($id) — fresh $CMD in $NAME"; refresh; fi
 }
 
+# An expired Claude login shows as "Login expired · Please run /login" on the agent's screen. A fresh process shows the
+# same screen, so restarting only churns: log it (once an hour) and leave the restart branches alone. Only the owner's
+# /login fixes it; `agents.sh status` prints login=EXPIRED and the exact command.
+login_expired() { tmux capture-pane -p -t "$NAME" -S -40 2>/dev/null | tail -n 25 \
+  | grep -qiE 'login expired|please run /login|invalid api key|oauth token has expired|not logged in'; }
+LAST_LOGIN_LOG="$HOME/.cache/agent-watchdog.last-login-log"
+note_login_expired() { [ "$(age_min "$LAST_LOGIN_LOG")" -gt 60 ] || return 0
+  log "LOGIN EXPIRED in $NAME: the owner must attach (tmux attach -t $NAME) and run /login; restarting would not help"; touch "$LAST_LOGIN_LOG"; }
+
+# Argus keep-alive (TESTER only). The Argus login is a session with a refresh token: ANY `argus cloud-*` command refreshes the
+# access token and rolls the refresh window forward (measured 2026-10-13: a session untouched for 4 days still worked and was
+# rewritten). So one cheap read-only call every ~30 min keeps the tester signed in for good, and the bare per-app token file that
+# older helpers read (~/.config/argus/tokens/<app>.author, an access token that goes stale in about an hour) is re-written from the
+# session each time, file to file, never printed. Re-check condition: at most once per 30 minutes (last-argus-ka file age).
+LAST_ARGUS="$HOME/.cache/agent-watchdog.last-argus-ka"; LAST_ARGUS_WARN="$HOME/.cache/agent-watchdog.last-argus-warn"
+argus_keepalive() {
+  [ "$ROLE" = tester ] || return 0
+  local url sess bin suffix apps app ok=0
+  url="$(PC get argus.url)"; sess="$HOME/.config/argus/session.json"
+  [ -n "$url" ] && [ -f "$sess" ] || return 0
+  [ "$(age_min "$LAST_ARGUS")" -ge 30 ] || return 0
+  touch "$LAST_ARGUS"
+  bin="$HOME/.local/bin/argus"; [ -x "$bin" ] || bin="$(command -v argus || true)"; [ -n "$bin" ] || return 0
+  suffix="$(PC get argus.instance_suffix)"
+  apps="$(PC get argus.apps | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin) or []))' 2>/dev/null)"
+  for app in $apps; do
+    if "$bin" cloud-executor-status --control-plane "$url" --instance-id "$app${suffix:+-$suffix}" >/dev/null 2>&1; then
+      ok=1
+      python3 - "$sess" "$HOME/.config/argus/tokens/$app.author" <<'PY' 2>/dev/null
+import json, os, sys
+tok = json.load(open(sys.argv[1])).get("access_token", "")
+if tok:
+    os.makedirs(os.path.dirname(sys.argv[2]), exist_ok=True)
+    fd = os.open(sys.argv[2] + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(tok + "\n")
+    os.replace(sys.argv[2] + ".new", sys.argv[2])
+PY
+    fi
+  done
+  if [ "$ok" = 0 ] && [ -n "$apps" ] && [ "$(age_min "$LAST_ARGUS_WARN")" -gt 60 ]; then
+    log "ARGUS SESSION could not refresh: the owner runs 'argus cloud-login --scope author' for this tester (a restart will not fix it)"; touch "$LAST_ARGUS_WARN"
+  fi
+}
+
+# Unanswered-asks safety net (BUILDER only): every ~30 min, kit/bin/slack-asks reads the watched channels itself with the bot token
+# (read only) and puts ONE board need on the dashboard for each Slack request that tags/names the agents, is older than 2 hours and
+# got no bot reply and no hand-over (at most 3 new per run). It does not depend on the agent's own judgement, so a missed or
+# mis-judged message still surfaces. Re-check condition: at most once per 30 minutes (last-asks file age); needs the bot token.
+LAST_ASKS="$HOME/.cache/agent-watchdog.last-asks"
+asks_check() {
+  [ "$ROLE" = builder ] || return 0
+  [ -f "$HOME/.config/slack-fetch/token" ] || return 0
+  [ "$(age_min "$LAST_ASKS")" -ge 30 ] || return 0
+  touch "$LAST_ASKS"
+  local out; out="$(HOME="$HOME" PAIR_CONFIG="$(PC path)" timeout 120 python3 "$KIT/kit/bin/slack-asks" --board --grace-min 120 --max-new 3 2>&1 | tail -3 | tr '\n' ' ')"
+  log "slack-asks: ${out:-no output}"
+}
+
 is_fresh_hour() { for h in $HOURS; do [ "$(date -u +%H)" = "$h" ] && return 0; done; return 1; }
 
 log "watchdog started for $NAME ($ROLE)"
 n=0
 while true; do
   check_restart_request
+  argus_keepalive
+  asks_check
   if [ $(( n++ % 10 )) -ne 0 ]; then sleep 60; continue; fi
   if ! tmux has-session -t "$NAME" 2>/dev/null; then
     log "session $NAME missing — starting $CMD"
@@ -70,6 +133,8 @@ while true; do
     log "claude not running in $NAME — fresh $CMD"
     refresh
     date -u +%F-%H > "$STAMP"
+  elif login_expired; then
+    note_login_expired
   elif is_fresh_hour && [ "$(cat "$STAMP" 2>/dev/null)" != "$(date -u +%F-%H)" ]; then
     log "scheduled fresh start: $CMD in $NAME"
     refresh
