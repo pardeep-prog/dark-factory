@@ -214,6 +214,12 @@ DM the owner when it needs a decision, a go or an approval, and read the answer 
    (the app's own channel), so the owner may never see it. Test with `kit/bin/slack-post --channel D… --message "test"`.
 3. **Add it to `slack.watch_channels` with key `owner-dm`** in pair.yaml. That both allows posting there and makes the agents read it every tick. Re-run `install.sh`.
 
+**Deploy approvals from the same DM.** The owner types `approve <namespace> <minutes>` (1 to 120 minutes, not a protected namespace) in that DM.
+The builder's watchdog runs `kit/bin/chat-approval scan` every minute: it reads the DM with the bot token, accepts only a message whose author is the
+owner's own Slack user (an agent holding only the bot token cannot post as the owner), uses each message once, opens the window and confirms in the DM.
+The bot needs the `im:history` scope. `kit/bin/deploy-window [<namespace>]` is a read-only check agents use to see whether a window is open. Nothing here
+lets an agent open or edit a window; typing the approval command in the workspace is still the strongest path.
+
 Footer: agent messages end `Sent by <bot> on behalf of <owner>` and never claim approval. `slack-post --approved` adds `· approved by <owner>`
 and is for a message the owner approved manually in that DM; wording that claims approval without the flag is stripped.
 

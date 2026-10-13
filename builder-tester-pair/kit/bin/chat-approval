@@ -3,6 +3,11 @@
 
   chat-approval teams <chat_id> <message_id>      # the owner's Teams self-chat (48:notes) or one of their DMs
   chat-approval slack <channel_id> <message_ts>   # a watched Slack channel or the owner's Slack DM
+  chat-approval scan [<channel_id>]               # the owner's Slack DM with the bot (default: slack.watch_channels key `owner-dm`); the WATCHDOG
+                                                  # runs this every minute, so "approve <namespace> <minutes>" typed in that DM opens the window
+                                                  # by itself. It reads with the bot token (no .mcp.json); the author is Slack's own `user` field,
+                                                  # which an agent holding only the bot token cannot set (its posts carry bot_id), so an agent
+                                                  # cannot forge it. Needs the bot scope im:history. The agent never runs or creates anything.
   chat-approval --selftest
 
 The agent only names WHERE the message is. This tool fetches the message ITSELF through the MCP connector named in
@@ -136,6 +141,68 @@ def fetch_slack(S, channel, ts):
     die("message not found in that channel at that ts")
 
 
+def slack_bot_history(S, channel, oldest, limit=20):
+    """Read a Slack conversation with the app's BOT token (the file slack-fetch/slack-post use). Needs no MCP server and no .mcp.json."""
+    import urllib.request
+    tp = os.path.expanduser(os.environ.get("SLACK_FETCH_TOKEN_FILE") or "~/.config/slack-fetch/token")
+    try:
+        tok = open(tp).read().strip()
+    except OSError:
+        die("no Slack bot token configured (the owner runs slack-fetch-setup.sh)")
+    if not tok.startswith("xoxb-"):
+        die("the saved Slack token is not a bot token")
+    api = os.environ.get("SLACK_API", "https://slack.com/api")
+    req = urllib.request.Request(f"{api}/conversations.history?channel={channel}&oldest={oldest:.6f}&limit={limit}",
+                                 headers={"Authorization": f"Bearer {tok}"})
+    try:
+        r = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+    except Exception as e:
+        die(f"could not reach Slack: {type(e).__name__}")
+    if not r.get("ok"):
+        die(f"Slack refused: {r.get('error')} (the bot needs im:history for a DM)")
+    return r.get("messages", [])
+
+
+def slack_bot_msg(m):
+    """A message in the shape check_and_parse wants. The author is Slack's own `user` field, which an agent holding only the bot token
+    cannot set: messages it posts carry bot_id and the bot's user id, never the owner's, so they can never pass as the owner."""
+    ts = str(m.get("ts"))
+    if m.get("bot_id") or m.get("subtype"):
+        return None
+    return {"author": m.get("user"), "text": strip_tags(re.sub(r"<@[UW][A-Z0-9]+(?:\|[^>]*)?>", " ", m.get("text") or "")),
+            "created": datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ts": ts}
+
+
+def scan_slack(S, channel):
+    """Approve every unused 'approve <namespace> <minutes>' the owner typed in the owner DM in the last 15 minutes. Run by the
+    watchdog (a kit process, not an agent), so the owner's message in Slack is enough: nobody has to open a terminal."""
+    done = 0
+    for m in slack_bot_history(S, channel, time.time() - MAX_AGE_MIN * 60 - 30):
+        msg = slack_bot_msg(m)
+        if not msg or not (S.approve_re.match(msg["text"] or "")):
+            continue
+        try:
+            ns, mins = check_and_parse(S, "slack", msg)
+            write_approval(S, ns, mins, "slack-dm", msg["ts"])
+            done += 1
+            reply(S, channel, f"Deploy window open for `{ns}` for {mins} min (until {time.strftime('%H:%M', time.gmtime(time.time() + mins * 60))} UTC). Approved by your message here.")
+        except SystemExit:
+            pass                      # refused or already used: the refusal text was printed above
+    if not done:
+        print("no new approvals")
+
+
+def reply(S, channel, text):
+    """Confirm in the same DM through slack-post (bot, disclosure line, no claim of approval beyond the owner's own message)."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        extra = ["--api", os.environ["SLACK_API"]] if os.environ.get("SLACK_API") else []
+        subprocess.run([sys.executable, os.path.join(here, "slack-post"), *extra, "--channel", channel, "--message", text],
+                       timeout=60, capture_output=True)
+    except Exception:
+        pass
+
+
 def check_and_parse(S, surface, msg, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     want = S.owner_teams if surface == "teams" else S.owner_slack
@@ -217,6 +284,17 @@ def selftest():
 def main():
     if sys.argv[1:2] == ["--selftest"]:
         return selftest()
+    if sys.argv[1:2] == ["scan"]:
+        import pairconf
+        cfg = pairconf.load()
+        S = Settings(cfg)
+        if S.tester_host and socket.gethostname() == S.tester_host:
+            die("the tester never deploys — chat approvals are for the builder's workspace")
+        ch = sys.argv[2] if len(sys.argv) > 2 else next((str(c.get("id")) for c in (pairconf.get(cfg, "slack.watch_channels") or [])
+                                                          if isinstance(c, dict) and c.get("key") == "owner-dm"), "")
+        if not ch:
+            die("no owner-dm channel in slack.watch_channels (and none given)")
+        return scan_slack(S, ch)
     if len(sys.argv) != 4 or sys.argv[1] not in ("teams", "slack"):
         print(__doc__); sys.exit(2)
     import pairconf

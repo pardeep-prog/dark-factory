@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""deploy-window — READ-ONLY: which deploy approval windows are open right now?
+
+  deploy-window            # lists open windows: scope, who opened it, until when (nothing is written, nothing is opened)
+  deploy-window <scope>    # exit 0 and "open until ..." when a window for that namespace/deployment is open, exit 1 and "closed" otherwise
+
+Why it exists: an agent that is unsure whether it may deploy used to ask the owner to "open a window" that was already open. This tells it
+the truth without trying a deploy, and it can neither create nor change a window (opening one stays the owner's: their own approval tool, or
+their exact `approve <namespace> <minutes>` message in the Slack DM, which the watchdog's `chat-approval scan` turns into one)."""
+import glob, json, os, sys, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import pairconf  # noqa: E402
+
+
+def open_windows():
+    cfg = pairconf.load()
+    d = os.environ.get("PAIR_APPROVALS_DIR") or str(pairconf.get(cfg, "paths.approvals") or "") or os.path.join(str(pairconf.ledger_dir(cfg)), "approvals")
+    now, out = time.time(), []
+    if os.path.islink(d):
+        return out
+    for f in sorted(glob.glob(os.path.join(d, "appr-*.json"))):
+        try:
+            if os.path.islink(f) or not os.path.isfile(f):
+                continue
+            a = json.load(open(f))
+        except Exception:
+            continue
+        if a.get("expires", 0) > now and a.get("by") and a.get("created") and len(a.get("scope", "")) >= 6:
+            out.append(a)
+    return out
+
+
+def main():
+    want = sys.argv[1] if len(sys.argv) > 1 else None
+    wins = open_windows()
+    if want:
+        hit = [a for a in wins if a["scope"] == want]
+        if hit:
+            print(f"open until {hit[0].get('expires_iso')} (scope {want}, opened by {hit[0].get('by')})")
+            return 0
+        print("closed")
+        return 1
+    if not wins:
+        print("no deploy window is open")
+    for a in wins:
+        print(f"{a['scope']}: until {a.get('expires_iso')} (by {a.get('by')})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
