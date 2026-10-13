@@ -118,6 +118,8 @@ slack:
   retired_channels: []          # channel ids never read again (e.g. a replaced group DM)
   workspace_org: ""             # set when the Slack workspace belongs to another organisation (most traffic is then out of scope)
   watch_channels: []            # [{key: dev, id: C0123, name: "#payments-dev"}]
+                                # ALSO add the owner's DM with the bot app, key `owner-dm`: [{key: owner-dm, id: D0123, name: "owner DM"}]
+                                # (agents ask decisions there and read the answers there; see docs/SETUP.md "Asking the owner in Slack")
 
 jira:
   project: ""                   # e.g. PAY

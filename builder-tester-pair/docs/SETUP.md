@@ -202,6 +202,21 @@ need (shown on the dashboard's "Needs you") for each request that is older than 
 quoted in a hand-over (max 3 new per run). It lists channels the bot cannot read ("invite the app there"); the bot must be a member of
 a channel for the check, the attachment download and a reply to work. Run it by hand any time: `slack-asks --grace-min 30`.
 
+## Asking the owner in Slack (`owner_decisions`, the `owner-dm` watch channel)
+
+The owner is not sitting in the agents' terminals, so a question asked only there is never seen. The `owner_decisions` rule makes the agent
+DM the owner when it needs a decision, a go or an approval, and read the answer from the same conversation. Set it up once:
+
+1. **Let the owner type in the bot's DM.** In the Slack app settings (api.slack.com/apps → your app → App Home) turn on **Messages Tab** and tick
+   **Allow users to send Slash commands and messages from the messages tab**. Without it the DM is read-only for the owner and cannot answer.
+2. **Find the right conversation id.** The owner types in their DM with the bot *user*; read it with the hub's `slack_read_channel` using the bot's
+   user id as `channel_id` (it prints `Channel: DM (D…)`). Posting to the owner's *user id* with the bot token lands in a different conversation
+   (the app's own channel), so the owner may never see it. Test with `kit/bin/slack-post --channel D… --message "test"`.
+3. **Add it to `slack.watch_channels` with key `owner-dm`** in pair.yaml. That both allows posting there and makes the agents read it every tick. Re-run `install.sh`.
+
+Footer: agent messages end `Sent by <bot> on behalf of <owner>` and never claim approval. `slack-post --approved` adds `· approved by <owner>`
+and is for a message the owner approved manually in that DM; wording that claims approval without the flag is stripped.
+
 ## Video feedback: how the tester gets the full picture (`kit/bin/video-context`)
 
 A feedback video reaches the tester one of two ways, and both end in the same **context pack**:
