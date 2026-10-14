@@ -83,7 +83,12 @@ while IFS= read -r DF_DIR; do
     for d in "$DF_DIR"/*/; do
       [ -f "$d/SKILL.md" ] || continue
       n="$(basename "$d")"
-      if [ -e "$HOME/.claude/skills/$n" ] && [ ! -L "$HOME/.claude/skills/$n" ]; then
+      if [ -d "$KIT/skills/$n" ]; then
+        # The kit's own skill wins over a same-named Dark Factory one. Measured 2026-10-13: a generic
+        # `channel-listener` (modes setup/check/forget, no list of this kit's rule keys) shadowed the kit's `tick` skill, so
+        # rules such as slack_video_feedback, video_inbox, monday_tasks and morning_digest were never applied.
+        echo "skill  $n (kept: the kit's own, not the dark_factory.skills_dir copy)"
+      elif [ -e "$HOME/.claude/skills/$n" ] && [ ! -L "$HOME/.claude/skills/$n" ]; then
         echo "skill  $n (kept: a real folder already exists in ~/.claude/skills)"
       else
         ln -sfn "${d%/}" "$HOME/.claude/skills/$n"; echo "skill  $n (from dark_factory.skills_dir)"

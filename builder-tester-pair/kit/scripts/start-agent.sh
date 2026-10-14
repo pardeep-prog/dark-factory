@@ -38,8 +38,13 @@ fi
 # stands down until it goes stale (lock_stale_minutes).
 LOCK="$HOME/.claude/channel-listener/state/listener.lock"
 [ -f "$LOCK" ] && { echo "released a listener lock left by the previous agent: $(head -c 200 "$LOCK")"; rm -f "$LOCK"; }
-printf -v LAUNCH '%sHOME=%q PAIR_CONFIG=%q PAIR_AGENT_SESSION=%q claude --permission-mode auto %q; exec bash' "$UMASK_PFX" "$HOME" "$CFG" "$NAME" "$CMD"
-echo "starting $NAME ($ROLE): claude --permission-mode auto \"$CMD\" in tmux session '$NAME' (Ctrl-b then d to leave it running)"
+# `<role>.permission_mode` (default auto): how the agent's Claude Code asks for approval. `bypassPermissions` skips every
+# approval prompt AND the auto-mode classifier (hooks and permission deny rules are separate and stay in place). The owner
+# chooses it per role in pair.yaml, knowingly; an agent never changes it.
+PMODE="$(PC get "$ROLE.permission_mode")"; PMODE="${PMODE:-auto}"
+case "$PMODE" in auto|bypassPermissions|acceptEdits|default|plan) ;; *) echo "invalid $ROLE.permission_mode '$PMODE' (auto|bypassPermissions|acceptEdits|default|plan)"; exit 1 ;; esac
+printf -v LAUNCH '%sHOME=%q PAIR_CONFIG=%q PAIR_AGENT_SESSION=%q claude --permission-mode %q %q; exec bash' "$UMASK_PFX" "$HOME" "$CFG" "$NAME" "$PMODE" "$CMD"
+echo "starting $NAME ($ROLE): claude --permission-mode $PMODE \"$CMD\" in tmux session '$NAME' (Ctrl-b then d to leave it running)"
 if [ "$ATTACH" = 1 ]; then
   exec tmux new -c "$ROOT" -s "$NAME" "$LAUNCH"
 fi

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""slack-fetch — download one Slack file (any size) by file id into the shared inbox, so the tester can run
+video-context on it. The Slack file tool of the hub stops at 10 MB; phone screen recordings are 100-500 MB.
+
+  slack-fetch <FILE_ID> [--out DIR] [--permalink URL] [--max-mb 2048] [--any-type] [--api URL]
+  slack-fetch --check                       # is a token configured? (prints yes/no, never the token)
+
+The token (a Slack token with ONLY the files:read scope) is read from the file named by $SLACK_FETCH_TOKEN_FILE, else
+~/.config/slack-fetch/token. The OWNER puts it there once (see docs/SETUP.md); an agent never creates, prints or
+copies it. It is sent only to slack.com hosts (a redirect elsewhere gets no header). Nothing it prints contains it.
+
+Exit codes: 0 ok · 2 bad use · 3 no token configured · 4 Slack refused (scope, not found, not a member) · 5 not a video /
+too big / not enough disk · 6 the download was not the file (HTML login page, short read)."""
+import argparse
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VIDEO_EXT = {".mp4", ".mov", ".webm", ".m4v", ".mkv"}
+
+
+def die(msg, code):
+    print(f"slack-fetch: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def token_path():
+    return os.path.expanduser(os.environ.get("SLACK_FETCH_TOKEN_FILE") or "~/.config/slack-fetch/token")
+
+
+def read_token():
+    p = token_path()
+    try:
+        mode = os.stat(p).st_mode
+        tok = open(p).read().strip()
+    except OSError:
+        return None
+    if mode & 0o077:
+        die(f"token file {p} is readable by others: chmod 600 it (the owner's step), refusing to use it", 3)
+    return tok or None
+
+
+def slack_host(host):
+    host = (host or "").lower()
+    if host == "127.0.0.1" and os.environ.get("SLACK_FETCH_ALLOW_LOCAL") == "1":      # test hook: 127.0.0.1 stands in for Slack
+        return True
+    return host == "slack.com" or host.endswith(".slack.com")
+
+
+class KeepAuthOnlyForSlack(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not slack_host(urllib.parse.urlsplit(newurl).hostname):
+            new.headers.pop("Authorization", None)
+            new.unredirected_hdrs.pop("Authorization", None)
+        return new
+
+
+def opener():
+    return urllib.request.build_opener(KeepAuthOnlyForSlack)
+
+
+def api_get(api, method, params, tok):
+    url = f"{api.rstrip('/')}/{method}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    try:
+        with opener().open(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        die(f"Slack answered HTTP {e.code} for {method}", 4)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        die(f"could not reach Slack for {method}: {type(e).__name__}", 4)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("file_id", nargs="?")
+    ap.add_argument("--out")
+    ap.add_argument("--permalink", default="")
+    ap.add_argument("--max-mb", type=int, default=2048)
+    ap.add_argument("--any-type", action="store_true")
+    ap.add_argument("--api", default="https://slack.com/api")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--whoami", action="store_true", help="print the workspace, the bot name and the channels it is a member of")
+    a = ap.parse_args()
+    os.umask(0o002)
+    tok = read_token()
+    if a.check:
+        print("token configured: " + ("yes" if tok else "no"))
+        sys.exit(0 if tok else 3)
+    if a.whoami:                                   # diagnostics that never print the token
+        if not tok:
+            die("no Slack token configured", 3)
+        who = api_get(a.api, "auth.test", {}, tok)
+        if not who.get("ok"):
+            die(f"Slack refused auth.test: {who.get('error', 'unknown')}", 4)
+        print(f"workspace={who.get('team', '?')} bot={who.get('user', '?')}")
+        names, cursor = [], ""
+        for _ in range(10):
+            page = api_get(a.api, "conversations.list", {"types": "public_channel,private_channel", "exclude_archived": "true",
+                                                         "limit": "200", **({"cursor": cursor} if cursor else {})}, tok)
+            if not page.get("ok"):
+                print(f"channels: cannot list ({page.get('error', 'unknown')})")
+                break
+            names += [c.get("name", "?") for c in page.get("channels", []) if c.get("is_member")]
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
+        else:
+            names.append("(more not shown)")
+        print("member of: " + (", ".join(sorted(names)) or "no channels (invite the app: /invite @<app name>)"))
+        sys.exit(0)
+    if not a.file_id or not a.file_id[:1].isalpha() or not a.file_id.isalnum():
+        die("give a Slack file id such as F0ABC12345", 2)
+    if not tok:
+        die("no Slack token configured. The owner creates one with files:read only and saves it to "
+            f"{token_path()} (chmod 600); until then drop the file in the inbox by hand", 3)
+    out = a.out or os.path.expanduser("~/video-inbox")
+    os.makedirs(out, exist_ok=True)
+
+    info = api_get(a.api, "files.info", {"file": a.file_id}, tok)
+    if not info.get("ok"):
+        die(f"Slack refused files.info: {info.get('error', 'unknown')} (missing_scope = the token needs files:read; "
+            "file_not_found / not_in_channel = the app cannot see that channel)", 4)
+    f = info["file"]
+    name = os.path.basename(f.get("name") or a.file_id) or a.file_id
+    size, mime, url = int(f.get("size") or 0), f.get("mimetype") or "", f.get("url_private_download") or f.get("url_private")
+    if not url:
+        die("Slack gave no download address for this file", 4)
+    if not a.any_type and not (mime.startswith("video/") or os.path.splitext(name)[1].lower() in VIDEO_EXT):
+        die(f"{name} is {mime or 'unknown type'}, not a video (use --any-type to fetch it anyway)", 5)
+    if size > a.max_mb * 1024 * 1024:
+        die(f"{name} is {size / 1e6:.0f} MB, over the {a.max_mb} MB limit", 5)
+    if shutil.disk_usage(out).free < size * 2 + (500 << 20):
+        die(f"not enough free disk in {out} for {size / 1e6:.0f} MB", 5)
+
+    dest = os.path.join(out, f"{a.file_id}_{name}")
+    part = dest + ".part"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    got = 0
+    try:
+        with opener().open(req, timeout=60) as r, open(part, "wb") as w:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if ctype.startswith("text/html"):
+                die("Slack returned a web page, not the file: the token cannot read this file (wrong token type or scope)", 6)
+            for chunk in iter(lambda: r.read(4 << 20), b""):
+                w.write(chunk)
+                got += len(chunk)
+    except (urllib.error.URLError, TimeoutError) as e:
+        if os.path.exists(part):
+            os.remove(part)
+        die(f"download failed: {type(e).__name__}", 6)
+    if size and got != size:
+        os.remove(part)
+        die(f"short read: got {got} bytes, Slack says the file is {size}", 6)
+    os.replace(part, dest)
+    os.chmod(dest, 0o664)
+    with open(dest + ".txt", "w") as s:                       # the sidecar the video_inbox rule reads
+        s.write(f"Slack file {a.file_id} ({name}, {size / 1e6:.1f} MB) {a.permalink or f.get('permalink', '')}\n"
+                f"sender: {f.get('user', 'unknown')}\n")
+    os.chmod(dest + ".txt", 0o664)
+    print(f"ok: {dest} ({got / 1e6:.1f} MB)")
+
+
+if __name__ == "__main__":
+    main()

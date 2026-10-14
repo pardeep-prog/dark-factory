@@ -160,6 +160,11 @@ Limit: the account still has passwordless sudo, which a guard hook cannot make u
 
 ### Moving the tester to its own workspace later
 
+`bash kit/scripts/move-tester.sh --pair <name> --host-pattern 'coder-<new workspace id>-*'` prepares step (a) as a
+reviewable `pair.yaml.separate.proposed` plus a diff, and changes nothing live. Also: `agents.sh status` now shows
+`login=EXPIRED` for an agent whose Claude login lapsed (a restart cannot fix it, only the owner's `/login` can), and
+the watchdog stops restarting such an agent and logs it hourly.
+
 Nothing is rebuilt. Create the workspace, then: (a) in `pair.yaml` set `tester.host` to `coder-<new workspace id>-*`, delete
 `tester.user`, `tester.uid`, `paths.share_group` and `guard.block_privilege_escalation`; (b) in the new workspace run
 `./setup --steps` (same shared folder, so the same `pair.yaml`); (c) sign the tester in there; (d) stop the tester here
@@ -194,6 +199,70 @@ Notes:
   `aws sso login --use-device-code`), and git identity scoping beyond what `./setup` measures (an organisation may
   pin it with its own `includeIf` config and commit hooks). Repos not on any remote (local-only branches, a private
   instance repo) cannot be re-cloned: keep them on the shared folder, or as `git bundle` files there.
+
+## What the agents pick up from Slack, and the safety net (`slack_threads`, `kit/bin/slack-asks`)
+
+The listener reads each watched channel (`slack.watch_channels`) and your DMs every tick. A message is a request when it tags the
+owner, tags the bot user (`slack.bot_user_id`) or names the builder or tester in any spelling; a person's reply inside a thread
+the agents are part of counts without a tag (rule `slack_threads`: a channel read only returns top-level messages, so threads are
+tracked in `state/slack-threads.json` and re-read when the 'Thread: N replies' marker changes; threads stay followed for
+`listener.thread_max_age_days` days). Attachments are downloaded with `slack-fetch --any-type` and looked at.
+
+Because those are written rules for an agent, a missed or mis-judged message is possible. `slack-asks` is the safety net that does not
+depend on the agent: every ~30 minutes the BUILDER's watchdog reads the watched channels itself (read only, bot token) and adds ONE board
+need (shown on the dashboard's "Needs you") for each request that is older than 2 hours, got no bot reply in its thread, and is not
+quoted in a hand-over (max 3 new per run). It lists channels the bot cannot read ("invite the app there"); the bot must be a member of
+a channel for the check, the attachment download and a reply to work. Run it by hand any time: `slack-asks --grace-min 30`.
+
+## Asking the owner in Slack (`owner_decisions`, the `owner-dm` watch channel)
+
+The owner is not sitting in the agents' terminals, so a question asked only there is never seen. The `owner_decisions` rule makes the agent
+DM the owner when it needs a decision, a go or an approval, and read the answer from the same conversation. Set it up once:
+
+1. **Let the owner type in the bot's DM.** In the Slack app settings (api.slack.com/apps → your app → App Home) turn on **Messages Tab** and tick
+   **Allow users to send Slash commands and messages from the messages tab**. Without it the DM is read-only for the owner and cannot answer.
+2. **Find the right conversation id.** The owner types in their DM with the bot *user*; read it with the hub's `slack_read_channel` using the bot's
+   user id as `channel_id` (it prints `Channel: DM (D…)`). Posting to the owner's *user id* with the bot token lands in a different conversation
+   (the app's own channel), so the owner may never see it. Test with `kit/bin/slack-post --channel D… --message "test"`.
+3. **Add it to `slack.watch_channels` with key `owner-dm`** in pair.yaml. That both allows posting there and makes the agents read it every tick. Re-run `install.sh`.
+
+Footer: agent messages end `Sent by <bot> on behalf of <owner>` and never claim approval. `slack-post --approved` adds `· approved by <owner>`
+and is for a message the owner approved manually in that DM; wording that claims approval without the flag is stripped.
+
+## Video feedback: how the tester gets the full picture (`kit/bin/video-context`)
+
+A feedback video reaches the tester one of two ways, and both end in the same **context pack**:
+
+1. **Slack, up to 10 MB** — rule `slack_video_feedback` (tester): a message with a video file that tags the owner or
+   names an agent. The Slack file tool refuses anything larger.
+2. **Shared inbox, any size** — rule `video_inbox` (tester): the owner drops the file into
+   `<paths.shared_root>/inbox/videos/` (optionally with `<file>.txt` beside it holding the Slack permalink / sender).
+   Screen recordings from a phone or tablet are usually 100–500 MB, so this is the normal path for them. A **link**
+   (Scribe, a web page) is not a video file and is refused: ask the sender for the file.
+
+**Letting the tester fetch big Slack files itself (`kit/bin/slack-fetch`) — one owner step.** The hub's Slack tool cannot
+return more than 10 MB and the agents hold no Slack token, so a big video would otherwise wait for you to download it.
+Create a Slack app (or use the bot you already have) with ONLY the `files:read` scope, invite it to the channels whose
+videos it should read, then run `bash kit/scripts/slack-fetch-setup.sh` in your own terminal: it asks for the token at a
+hidden prompt, checks it with Slack (refusing one that can do more than read files), and saves it mode 600 for every tester
+(`~/.config/slack-fetch/token` in each tester's agent home), never printing it.
+`slack-fetch --check` prints `token configured: yes|no`, never the token. The token is sent only to slack.com hosts,
+a download that is a web page or short is rejected, and the agent can neither create nor print it. Tests:
+`python3 kit/tests/test_slack_fetch.py` (mock Slack, no network).
+
+`video-context <file> [--source TEXT] [--speaker NAME]` writes `ctx/<id>/` next to the file: `context.md` (flags, a
+timeline of `[mm:ss]` speech with the frame to look at, the full transcript), `frames/f_MMSS_NN.jpg` (one at the start of
+every spoken line plus a safety frame every 15 s; the file name is the time), and `sheet_NN.jpg` contact sheets (9 frames
+per image). It adds **quality flags** so nobody builds from audio that is not there: empty or silent audio, no audio
+track, very little speech, a stuck repeat, a non-English line in an English model. Whisper's `[BLANK_AUDIO]` is dropped,
+not passed on as speech. The same bytes are never processed twice. The tester runs it with `--delete-source`: the video and its
+note are deleted as soon as the pack is complete (a failed intake keeps the video so it can be retried), and the pack folder
+is deleted once the hand-over it fed is done.
+
+The tester must READ `context.md` and LOOK at the frames (the narration is what the person meant, the frame is what the
+app did) and every extracted requirement cites `[mm:ss]` and a frame; the spec handed to the builder names the pack's
+`context.md` as its source, so the builder reads the same transcript and opens the same frames. Tests: `python3
+kit/tests/test_video_context.py` (speech test skipped, not passed, when whisper or its model is missing).
 
 ## Chat commands (your Teams self-chat)
 

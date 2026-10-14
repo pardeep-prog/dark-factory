@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""video-context — turn a feedback video into a context pack an agent can fully read: transcript + frames aligned to speech.
+
+  video-context <video> [--id ID] [--source TEXT] [--speaker NAME] [--out DIR] [--model small.en]
+                        [--interval 15] [--max-frames 80] [--threads 2] [--force]
+
+What it adds on top of df-video-intake (same tools: ffmpeg, whisper-cli):
+  * a frame at the START OF EVERY SPOKEN CUE (what is said is paired with what is on screen), plus a safety frame every
+    --interval seconds so silent stretches are still covered, thinned evenly to --max-frames;
+  * contact sheets (3x3 grids) so the analyst can scan 9 frames per image read;
+  * one timeline file, context.md, that interleaves [mm:ss] speech with the frame to read, plus the full transcript;
+  * QUALITY FLAGS (empty/silent audio, a stuck "hallucinated" repeat, too few words, no video, very long) so nobody
+    builds from a transcript that is not there;
+  * idempotent (same bytes -> same id -> reuse) and polite to the machine (nice, 2 threads) so it never starves the agents.
+
+It reads the file it is given and writes only under --out. It never touches the network and prints no file content.
+Frame <-> time: every frame file name carries its time (f_MMSS_NN.jpg = mm:ss into the video)."""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+WHISPER_BIN = ("whisper-cli", "whisper-cpp")
+MODEL_DIRS = ("/user/shared/tools/whisper-models", os.path.expanduser("~/.cache/whisper-cpp"))
+SHEET_COLS, SHEET_ROWS = 3, 3
+
+
+def die(msg, code=2):
+    print(f"video-context: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    return subprocess.run(["nice", "-n", "10"] + cmd, capture_output=True, text=True, **kw)
+
+
+def mmss(t):
+    t = int(t)
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+
+def sha_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def probe(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"ffprobe could not read {os.path.basename(path)}: {r.stderr.strip()[:200]}")
+    d = json.loads(r.stdout or "{}")
+    v = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"), None)
+    a = next((s for s in d.get("streams", []) if s.get("codec_type") == "audio"), None)
+    dur = float((d.get("format") or {}).get("duration") or (v or {}).get("duration") or 0)
+    return {"duration": dur, "size": int((d.get("format") or {}).get("size") or 0), "video": v, "audio": a}
+
+
+def mean_volume(wav):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", wav, "-af", "volumedetect", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", r.stderr)
+    return float(m.group(1)) if m else None
+
+
+def parse_srt(path):
+    cues, text = [], open(path, encoding="utf-8", errors="replace").read()
+    for blk in re.split(r"\n\s*\n", text.strip()):
+        lines = blk.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        m = re.match(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)", lines[1])
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()]
+        start, end = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000, g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        cues.append({"start": start, "end": end, "text": " ".join(l.strip() for l in lines[2:]).strip()})
+    return cues
+
+
+def find_model(name):
+    for d in MODEL_DIRS:
+        p = os.path.join(d, f"ggml-{name}.bin")
+        if os.path.isfile(p):
+            return p
+    die(f"whisper model ggml-{name}.bin not found in {MODEL_DIRS}: nothing is downloaded automatically")
+
+
+def pick_times(cues, duration, interval, max_frames):
+    """Cue-start frames (merged when closer than 4 s) + a safety frame every `interval` s, thinned evenly."""
+    cue_t = []
+    for c in cues:
+        t = min(c["start"] + 0.5, max(duration - 0.5, 0))
+        if not cue_t or t - cue_t[-1] >= 4:
+            cue_t.append(t)
+    # whisper often returns one long segment: add a frame every `interval` s inside any cue longer than that
+    for c in cues:
+        t = c["start"] + interval
+        while t < min(c["end"], duration - 0.5):
+            cue_t.append(t)
+            t += interval
+    # short clips still get ~8 frames: the safety step shrinks with the duration
+    step = max(2.0, min(interval, duration / 8.0))
+    safety, t = [], 0.0
+    while t < duration - 0.5:
+        if all(abs(t - c) >= step / 2 for c in cue_t):
+            safety.append(t)
+        t += step
+    times = sorted(set(round(t, 1) for t in cue_t + safety))
+    if not times or times[0] > 1.5:
+        times.insert(0, 0.5)             # always have the opening screen
+    if len(times) > max_frames:
+        step = len(times) / max_frames
+        times = [times[int(i * step)] for i in range(max_frames)]
+    return times
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("video")
+    ap.add_argument("--id")
+    ap.add_argument("--source", default="")
+    ap.add_argument("--speaker", default="")
+    ap.add_argument("--out")
+    ap.add_argument("--model", default="small.en")
+    ap.add_argument("--interval", type=float, default=15)
+    ap.add_argument("--max-frames", type=int, default=80)
+    ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--delete-source", action="store_true",
+                    help="after the pack is built (context.md + .done written), delete the video and its <file>.txt note: the pack keeps what is needed")
+    a = ap.parse_args()
+    os.umask(0o002)                      # the pair shares one group: both agents must be able to read the pack
+
+    if not os.path.isfile(a.video):
+        die(f"file not found: {a.video}")
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            die(f"{tool} is not installed")
+    whisper = next((w for w in WHISPER_BIN if shutil.which(w)), None)
+    if not whisper:
+        die("whisper-cli is not installed")
+    info = probe(a.video)
+    if not info["video"] or info["duration"] <= 0:
+        die("no readable video stream or zero duration: not a playable video (a Scribe/web link is not a video file)")
+
+    digest = sha_of(a.video)
+    vid = a.id or digest[:12]
+    base = a.out or os.path.join(os.path.dirname(os.path.abspath(a.video)), "ctx")
+    out = os.path.join(base, vid)
+    marker = os.path.join(out, ".done")
+    def drop_source():
+        """Delete the source video and its note, only called once the pack is complete (context.md + .done on disk)."""
+        if not a.delete_source or not (os.path.isfile(os.path.join(out, "context.md")) and os.path.isfile(marker)):
+            return
+        for f in (a.video, a.video + ".txt"):
+            try:
+                os.remove(f)
+                print(f"deleted source: {os.path.basename(f)}")
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"could not delete {os.path.basename(f)}: {type(e).__name__}", file=sys.stderr)
+
+    if os.path.isfile(marker) and open(marker).read().strip() == digest and not a.force:
+        print(f"already done: {out}/context.md")
+        drop_source()
+        return
+    os.makedirs(os.path.join(out, "frames"), exist_ok=True)
+
+    flags, t0 = [], time.time()
+    # ---- audio + transcript -------------------------------------------------------------------------------
+    cues, words = [], 0
+    if info["audio"]:
+        wav = os.path.join(out, "audio.wav")
+        r = run(["ffmpeg", "-y", "-i", a.video, "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav])
+        if r.returncode != 0:
+            die("audio extraction failed: " + r.stderr[-200:])
+        vol = mean_volume(wav)
+        if vol is not None and vol < -50:
+            flags.append(f"SILENT AUDIO: mean volume {vol:.0f} dB. The speech may not be on this track")
+        r = run([whisper, "-m", find_model(a.model), "-f", wav, "-osrt", "-otxt", "-of", os.path.join(out, "transcript"),
+                 "-t", str(a.threads)])
+        if r.returncode != 0:
+            die("transcription failed: " + r.stderr[-300:])
+        srt = os.path.join(out, "transcript.srt")
+        cues = parse_srt(srt) if os.path.isfile(srt) else []
+        os.remove(wav)                   # large, and fully reproducible from the video
+        # drop consecutive duplicate cues: the classic whisper repeat on silence/noise
+        dedup, repeats = [], 0
+        for c in cues:
+            if dedup and c["text"].lower() == dedup[-1]["text"].lower():
+                repeats += 1
+                continue
+            dedup.append(c)
+        if repeats >= 3:
+            flags.append(f"REPEATED LINES: {repeats} consecutive duplicate cues were dropped. The audio is probably noise or silence there")
+        # whisper marks non-speech as a whole bracketed tag: [BLANK_AUDIO], (silence), [MUSIC], [ Inaudible ]
+        cues = [c for c in dedup if c["text"] and not re.fullmatch(r"[\[\(*].*[\]\)*]", c["text"].strip())]
+        words = sum(len(c["text"].split()) for c in cues)
+        if not cues:
+            flags.append("EMPTY TRANSCRIPT: no speech was recognised. Do not build from this video's audio; ask the sender")
+        elif info["duration"] >= 60 and words / (info["duration"] / 60) < 10:
+            flags.append(f"VERY LITTLE SPEECH: {words} words in {mmss(info['duration'])}. Most of this video is not narrated: read the frames")
+    else:
+        flags.append("NO AUDIO TRACK: there is no speech to transcribe. Read the frames only, and ask the sender what they meant")
+    if info["duration"] > 30 * 60:
+        flags.append(f"LONG VIDEO ({mmss(info['duration'])}): frames are thinned to {a.max_frames}. Ask for the part that matters if details are missing")
+    if any(re.search(r"[^\x00-\x7f]", c["text"]) for c in cues) and a.model.endswith(".en"):
+        flags.append("NON-ENGLISH TEXT in an English-only model's output: the transcript may be garbled. Verify against the frames")
+
+    # ---- frames -------------------------------------------------------------------------------------------
+    times = pick_times(cues, info["duration"], a.interval, a.max_frames)
+    frames = []
+    for i, t in enumerate(times, 1):
+        name = f"f_{int(t) // 60:02d}{int(t) % 60:02d}_{i:02d}.jpg"
+        path = os.path.join(out, "frames", name)
+        r = run(["ffmpeg", "-y", "-ss", f"{t:.1f}", "-i", a.video, "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2", "-q:v", "4", path])
+        if r.returncode == 0 and os.path.isfile(path):
+            frames.append((t, name))
+    if not frames:
+        die("no frames could be extracted")
+
+    # ---- contact sheets (3x3) -----------------------------------------------------------------------------
+    sheets, per = [], SHEET_COLS * SHEET_ROWS
+    for s in range(0, len(frames), per):
+        chunk = frames[s:s + per]
+        tmp = os.path.join(out, f".seq{s}")
+        os.makedirs(tmp, exist_ok=True)
+        for k, (_, name) in enumerate(chunk, 1):
+            shutil.copyfile(os.path.join(out, "frames", name), os.path.join(tmp, f"{k:02d}.jpg"))
+        sheet = f"sheet_{s // per + 1:02d}.jpg"
+        r = run(["ffmpeg", "-y", "-i", os.path.join(tmp, "%02d.jpg"), "-vf",
+                 f"scale=640:-2,tile={SHEET_COLS}x{SHEET_ROWS}", "-frames:v", "1", "-q:v", "4", os.path.join(out, sheet)])
+        shutil.rmtree(tmp, ignore_errors=True)
+        if r.returncode == 0:
+            sheets.append((sheet, chunk[0][0], chunk[-1][0], [mmss(t) for t, _ in chunk]))
+
+    # ---- context.md ---------------------------------------------------------------------------------------
+    def frame_at(t):
+        return min(frames, key=lambda f: abs(f[0] - t))
+
+    L = ["# Video context pack", "",
+         f"- id: `{vid}`   sha256: `{digest[:16]}…`   size: {info['size'] / 1e6:.1f} MB   duration: {mmss(info['duration'])}",
+         f"- source: {a.source or '(not given)'}   speaker: {a.speaker or '(not given)'}",
+         f"- transcript: whisper `{a.model}` ({len(cues)} cues, {words} words)   frames: {len(frames)}   built in {time.time() - t0:.0f}s",
+         ""]
+    L += ["## Flags (read first)", ""] + ([f"- ⚠ {f}" for f in flags] if flags else ["- none"]) + [""]
+    L += ["## How to read this", "",
+          "1. Read the **Timeline** top to bottom: each line is what was said at `[mm:ss]` and the frame that shows the screen at that moment.",
+          "2. Scan the **contact sheets** first (9 frames per image, left-to-right, top-to-bottom, times listed), then open single frames "
+          "only where the speech refers to something on screen. The narration says what the person MEANT, the frame shows what the app DID: "
+          "when they disagree, say so.",
+          "3. Every issue you extract must cite `[mm:ss]` and a frame file. An issue without both is an open question, not a requirement.",
+          "4. A transcript line can be misheard (names, codes, acronyms). Check numbers and codes against a frame before using them.",
+          ""]
+    L += ["## Contact sheets", ""]
+    for sheet, t1, t2, times_s in sheets:
+        L.append(f"- `{sheet}`: {mmss(t1)}–{mmss(t2)}, frames at {', '.join(times_s)}")
+    L += ["", "## Timeline", ""]
+    used, rows = set(), []
+    for c in cues:
+        ft, fname = frame_at(c["start"] + 0.5)
+        ref = f"`frames/{fname}`" if fname not in used else f"(same screen: `frames/{fname}`)"
+        used.add(fname)
+        during = [n for t_, n in frames if c["start"] + 0.5 < t_ < c["end"] and n not in used]
+        used.update(during)
+        more = ("  Also during this line: " + ", ".join(f"`frames/{n}` ({n[2:4]}:{n[4:6]})" for n in during)) if during else ""
+        rows.append((c["start"], f"- **[{mmss(c['start'])}]** “{c['text']}” → {ref}{more}"))
+    for ft, fname in frames:
+        if fname not in used:
+            rows.append((ft, f"- **[{mmss(ft)}]** *(no speech nearby)* → `frames/{fname}`"))
+    L += [line for _, line in sorted(rows, key=lambda r: r[0])]
+    L += ["", "## Full transcript", ""] + [f"[{mmss(c['start'])}] {c['text']}" for c in cues] + [""]
+    with open(os.path.join(out, "context.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    with open(marker, "w") as f:
+        f.write(digest)
+    for root, dirs, files in os.walk(out):          # group-readable for the other agent
+        for n in dirs + files:
+            try:
+                os.chmod(os.path.join(root, n), 0o775 if os.path.isdir(os.path.join(root, n)) else 0o664)
+            except OSError:
+                pass
+    print(f"ok: {out}/context.md   frames={len(frames)} sheets={len(sheets)} cues={len(cues)} flags={len(flags)}")
+    for fl in flags:
+        print(f"FLAG: {fl}")
+    drop_source()
+
+
+if __name__ == "__main__":
+    main()
