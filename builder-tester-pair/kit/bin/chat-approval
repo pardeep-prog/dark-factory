@@ -3,6 +3,11 @@
 
   chat-approval teams <chat_id> <message_id>      # the owner's Teams self-chat (48:notes) or one of their DMs
   chat-approval slack <channel_id> <message_ts>   # a watched Slack channel or the owner's Slack DM
+  chat-approval scan [<channel_id>]               # the owner's Slack DM with the bot (default: slack.watch_channels key `owner-dm`); the WATCHDOG
+                                                  # runs this every minute, so "approve <namespace> <minutes>" typed in that DM opens the window
+                                                  # by itself. It reads with the bot token (no .mcp.json); the author is Slack's own `user` field,
+                                                  # which an agent holding only the bot token cannot set (its posts carry bot_id), so an agent
+                                                  # cannot forge it. Needs the bot scope im:history. The agent never runs or creates anything.
   chat-approval --selftest
 
 The agent only names WHERE the message is. This tool fetches the message ITSELF through the MCP connector named in
@@ -30,7 +35,11 @@ MAX_AGE_MIN, MAX_WINDOW = 15, 120
 BASE_PROTECTED = {"kube-system", "kube-public", "kube-node-lease", "default"}
 
 
+LAST_REFUSAL = {"msg": ""}
+
+
 def die(msg):
+    LAST_REFUSAL["msg"] = msg
     print("refused: " + msg)
     sys.exit(1)
 
@@ -57,9 +66,12 @@ class Settings:
         self.appr_dir = os.environ.get("PAIR_APPROVALS_DIR") or str(g("paths.approvals") or os.path.join(ledger, "approvals"))
         self.__dict__.update(override)
         self.used = os.path.join(self.appr_dir, ".chat-approvals-used.json")
+        # A valid Kubernetes name is 1-63 characters, so the pattern accepts that and check_and_parse refuses a short one with its OWN
+        # reason (the deploy gate only honours scopes of 6+ characters): a valid-looking "approve dev 30" must not get a vague refusal.
         self.approve_re = re.compile(
-            r"^(?:@?(?:" + self.address + r")\s*[-,:—]*\s*)?approve\s+([a-z0-9](?:[-a-z0-9]{4,61}[a-z0-9]))\s+(\d{1,3})"
+            r"^(?:@?(?:" + self.address + r")\s*[-,:—]*\s*)?approve\s+([a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)\s+(\d{1,3})"
             r"\s*(?:m|min|mins|minutes)?\s*$", re.I)
+        self.attempt_re = re.compile(r"^(?:@?(?:" + self.address + r")\s*[-,:—]*\s*)?approve\b", re.I)
 
 
 def strip_tags(s):
@@ -136,6 +148,92 @@ def fetch_slack(S, channel, ts):
     die("message not found in that channel at that ts")
 
 
+def slack_bot_history(S, channel, oldest, limit=20):
+    """Read a Slack conversation with the app's BOT token (the file slack-fetch/slack-post use). Needs no MCP server and no .mcp.json."""
+    import urllib.request
+    tp = os.path.expanduser(os.environ.get("SLACK_FETCH_TOKEN_FILE") or "~/.config/slack-fetch/token")
+    try:
+        tok = open(tp).read().strip()
+    except OSError:
+        die("no Slack bot token configured (the owner runs slack-fetch-setup.sh)")
+    if not tok.startswith("xoxb-"):
+        die("the saved Slack token is not a bot token")
+    api = os.environ.get("SLACK_API", "https://slack.com/api")
+    req = urllib.request.Request(f"{api}/conversations.history?channel={channel}&oldest={oldest:.6f}&limit={limit}",
+                                 headers={"Authorization": f"Bearer {tok}"})
+    try:
+        r = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+    except Exception as e:
+        die(f"could not reach Slack: {type(e).__name__}")
+    if not r.get("ok"):
+        die(f"Slack refused: {r.get('error')} (the bot needs im:history for a DM)")
+    return r.get("messages", [])
+
+
+def slack_bot_msg(m):
+    """A message in the shape check_and_parse wants. The author is Slack's own `user` field, which an agent holding only the bot token
+    cannot set: messages it posts carry bot_id and the bot's user id, never the owner's, so they can never pass as the owner."""
+    ts = str(m.get("ts"))
+    if m.get("bot_id") or m.get("subtype"):
+        return None
+    return {"author": m.get("user"), "text": strip_tags(re.sub(r"<@[UW][A-Z0-9]+(?:\|[^>]*)?>", " ", m.get("text") or "")),
+            "created": datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ts": ts}
+
+
+def scan_slack(S, channel):
+    """Approve every unused 'approve <namespace> <minutes>' the owner typed in the owner DM in the last 15 minutes. Run by the
+    watchdog (a kit process, not an agent), so the owner's message in Slack is enough: nobody has to open a terminal."""
+    done = 0
+    for m in slack_bot_history(S, channel, time.time() - MAX_AGE_MIN * 60 - 30):
+        msg = slack_bot_msg(m)
+        if not msg or msg.get("author") != S.owner_slack or not S.attempt_re.match(msg["text"] or ""):
+            continue                  # only the owner's own approval attempts get any answer
+        try:
+            ns, mins = check_and_parse(S, "slack", msg)
+            write_approval(S, ns, mins, "slack-dm", msg["ts"])
+            done += 1
+            reply(S, channel, f"Deploy window open for `{ns}` for {mins} min (until {time.strftime('%H:%M', time.gmtime(time.time() + mins * 60))} UTC). Approved by your message here.")
+        except SystemExit:
+            # Silence would look exactly like "window open", so a REFUSAL is answered too, once per message (not again on every scan).
+            why = LAST_REFUSAL["msg"] or "refused"
+            if "already used" not in why and not refusal_seen(S, msg["ts"]):
+                note_refusal(S, msg["ts"])
+                reply(S, channel, f"No deploy window was opened: {why}. Send `approve <namespace> <minutes>` again with a valid namespace.")
+    if not done:
+        print("no new approvals")
+
+
+def refusal_seen(S, ts):
+    try:
+        return f"slack-dm-refused:{ts}" in set(json.load(open(S.used)))
+    except Exception:
+        return False
+
+
+def note_refusal(S, ts):
+    try:
+        used = set(json.load(open(S.used)))
+    except Exception:
+        used = set()
+    os.makedirs(S.appr_dir, mode=0o700, exist_ok=True)
+    used.add(f"slack-dm-refused:{ts}")
+    tmp = S.used + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(used), f)
+    os.replace(tmp, S.used)
+
+
+def reply(S, channel, text):
+    """Confirm in the same DM through slack-post (bot, disclosure line, no claim of approval beyond the owner's own message)."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        extra = ["--api", os.environ["SLACK_API"]] if os.environ.get("SLACK_API") else []
+        subprocess.run([sys.executable, os.path.join(here, "slack-post"), *extra, "--channel", channel, "--message", text],
+                       timeout=60, capture_output=True)
+    except Exception:
+        pass
+
+
 def check_and_parse(S, surface, msg, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     want = S.owner_teams if surface == "teams" else S.owner_slack
@@ -148,6 +246,8 @@ def check_and_parse(S, surface, msg, now=None):
     if not m:
         die("text must be exactly: approve <namespace> <minutes>")
     ns, mins = m.group(1).lower(), int(m.group(2))
+    if len(ns) < 6:
+        die(f"'{ns}' is a valid namespace name but shorter than 6 characters, and the deploy gate only honours approvals for scopes of 6 or more characters. Open that window in the workspace instead")
     if ns in S.protected:
         die(f"{ns} is a protected namespace — approve it in the workspace")
     if not 1 <= mins <= MAX_WINDOW:
@@ -217,6 +317,17 @@ def selftest():
 def main():
     if sys.argv[1:2] == ["--selftest"]:
         return selftest()
+    if sys.argv[1:2] == ["scan"]:
+        import pairconf
+        cfg = pairconf.load()
+        S = Settings(cfg)
+        if S.tester_host and socket.gethostname() == S.tester_host:
+            die("the tester never deploys — chat approvals are for the builder's workspace")
+        ch = sys.argv[2] if len(sys.argv) > 2 else next((str(c.get("id")) for c in (pairconf.get(cfg, "slack.watch_channels") or [])
+                                                          if isinstance(c, dict) and c.get("key") == "owner-dm"), "")
+        if not ch:
+            die("no owner-dm channel in slack.watch_channels (and none given)")
+        return scan_slack(S, ch)
     if len(sys.argv) != 4 or sys.argv[1] not in ("teams", "slack"):
         print(__doc__); sys.exit(2)
     import pairconf

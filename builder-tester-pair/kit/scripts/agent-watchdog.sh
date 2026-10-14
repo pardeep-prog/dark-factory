@@ -174,6 +174,16 @@ schedule_tick() {   # sets SCHED_WANT ("off" or "every N"); returns 1 when the a
   return 0
 }
 
+# Owner approvals typed in Slack (BUILDER only): every minute `chat-approval scan` reads the owner's DM with the bot (bot token, read only) and turns
+# an exact "approve <namespace> <minutes>" from the OWNER's account into a deploy window, then confirms in that DM. Runs here, in a kit process,
+# so the owner's message is enough and the agent never touches an approval. Skipped when there is no bot token or no owner-dm channel.
+approvals_scan() {
+  [ "$ROLE" = builder ] || return 0
+  [ -f "$HOME/.config/slack-fetch/token" ] || return 0
+  local out; out="$(HOME="$HOME" PAIR_CONFIG="$(PC path)" timeout 90 python3 "$KIT/kit/bin/chat-approval" scan 2>&1 | tail -2 | tr '\n' ' ')"
+  case "$out" in "no new approvals"*|"") ;; *) log "chat-approval: $out" ;; esac
+}
+
 is_fresh_hour() { for h in $HOURS; do [ "$(date -u +%H)" = "$h" ] && return 0; done; return 1; }
 
 log "watchdog started for $NAME ($ROLE)"
@@ -182,6 +192,7 @@ while true; do
   check_restart_request
   argus_keepalive
   asks_check
+  approvals_scan
   schedule_tick || { sleep 60; continue; }
   wake_tick
   if [ $(( n++ % 10 )) -ne 0 ]; then sleep 60; continue; fi

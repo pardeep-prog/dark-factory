@@ -2,7 +2,7 @@
 # slack-fetch-setup.sh — the OWNER runs this once, in their own terminal, to give the TESTER agents a Slack token with
 # files:read so `slack-fetch` can download videos of any size. An agent must never run it: it handles a credential.
 #
-#   bash kit/scripts/slack-fetch-setup.sh                      # every tester in /user/shared/pairs/*/pair.yaml
+#   PAIRS_DIR=/path/to/pairs bash kit/scripts/slack-fetch-setup.sh   # every tester in $PAIRS_DIR/*/pair.yaml (or PAIR_CONFIG's parent folder)
 #   bash kit/scripts/slack-fetch-setup.sh --user wong --home /home/coder/agents/wong [--user vision --home ...]
 #   bash kit/scripts/slack-fetch-setup.sh --allow-extra-scopes # accept a token that has more than files:read
 #
@@ -25,7 +25,9 @@ import glob, os, sys
 sys.path.insert(0, sys.argv[1] + "/kit/lib")
 import pairconf
 seen = set()
-for p in sorted(glob.glob("/user/shared/pairs/*/pair.yaml")):
+# The pairs folder is read from PAIRS_DIR, else from the folder that holds this pair's own pair.yaml (PAIR_CONFIG); with neither, nothing is guessed.
+pairs_dir = os.environ.get("PAIRS_DIR") or (os.path.dirname(os.path.dirname(os.path.abspath(os.environ["PAIR_CONFIG"]))) if os.environ.get("PAIR_CONFIG") else "")
+for p in sorted(glob.glob(os.path.join(pairs_dir, "*", "pair.yaml"))) if pairs_dir else []:
     try:
         c = pairconf.load(p)
     except (Exception, SystemExit):
@@ -45,8 +47,11 @@ IFS= read -rs TOKEN; echo >&2
 [ -n "$TOKEN" ] || { echo "empty input, nothing done" >&2; exit 1; }
 
 # Validate with auth.test; the token goes in a header read from stdin, never on the command line.
-RESULT="$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sS -m 20 -D - -K - -X POST "$API/auth.test" -o /tmp/.slack-setup.$$ || true)"
-BODY="$(cat /tmp/.slack-setup.$$ 2>/dev/null || true)"; rm -f /tmp/.slack-setup.$$
+# The response body goes to a private mktemp file (mode 600, unpredictable name, removed on every exit): a fixed /tmp/.name.$$ could be
+# pre-created by another local user as a symlink and curl would write through it as the owner.
+BODYF="$(mktemp "${TMPDIR:-/tmp}/slack-setup.XXXXXXXX")"; trap 'rm -f "$BODYF"' EXIT
+RESULT="$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sS -m 20 -D - -K - -X POST "$API/auth.test" -o "$BODYF" || true)"
+BODY="$(cat "$BODYF" 2>/dev/null || true)"
 SCOPES="$(printf '%s' "$RESULT" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}')"
 read -r OK WHO < <(printf '%s' "$BODY" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
