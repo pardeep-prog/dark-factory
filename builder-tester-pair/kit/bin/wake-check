@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""wake-check — is there anything NEW for this agent? Answered by a script, so no model is called until there is.
+
+  wake-check            # exit 0 + "wake: <why>" when something new arrived since the last acknowledged check; exit 1 + "quiet" otherwise
+  wake-check --ack      # remember what was seen (the watchdog runs it right after it wakes the agent)
+  wake-check --selftest
+
+What counts as new (read-only, no model):
+  * a Slack message not written by the bot in any `slack.watch_channels` entry (including the owner DM, key owner-dm), and a thread whose
+    latest reply is newer than the last check; read with the app's BOT token (the file slack-fetch / slack-post use), the same read access as
+    kit/bin/slack-asks;
+  * a change in this role's hand-over list (`handoff list --for <role>`): a new hand-over or a new state.
+The watchdog (kit/scripts/agent-watchdog.sh) uses it when `schedule.wake_on_change: true`: instead of a repeating model-driven check-in every
+few minutes, the agent sits idle (no tokens) and is sent one `/channel-listener tick` only when this says something is new, plus one
+heartbeat tick every `schedule.wake_heartbeat_minutes` (default 120) for the periodic jobs (dashboard, digest, knowledge).
+State: ~/.cache/wake-check.json. A channel the bot cannot read is skipped (it never wakes)."""
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "lib"))
+import pairconf  # noqa: E402
+
+STATE = pathlib.Path(os.path.expanduser("~/.cache/wake-check.json"))
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def api_get(method, params, tok, base):
+    req = urllib.request.Request(f"{base}/{method}?{urllib.parse.urlencode(params)}", headers={"Authorization": f"Bearer {tok}"})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=20).read().decode())
+    except Exception:
+        return {"ok": False, "error": "unreachable"}
+
+
+def scan(cfg, state, now):
+    """Returns (reasons, new_state). New state is only written by --ack."""
+    tok_path = os.path.expanduser(os.environ.get("SLACK_FETCH_TOKEN_FILE") or "~/.config/slack-fetch/token")
+    try:
+        tok = open(tok_path).read().strip()
+    except OSError:
+        tok = ""
+    base = os.environ.get("SLACK_API", "https://slack.com/api")
+    bot = str(pairconf.get(cfg, "slack.bot_user_id") or "")
+    mine = [bot and f"<@{bot}", str(pairconf.get(cfg, "owner.slack_user_id") or "") and f"<@{pairconf.get(cfg, 'owner.slack_user_id')}",
+            str(pairconf.get(cfg, "builder.name") or ""), str(pairconf.get(cfg, "tester.name") or ""),
+            *[str(n) for n in (pairconf.get(cfg, "slack.name_matches") or [])]]
+    reasons, new = [], {"slack": dict(state.get("slack", {})), "handoffs": state.get("handoffs", "")}
+    if tok:
+        for c in (pairconf.get(cfg, "slack.watch_channels") or []):
+            if not isinstance(c, dict) or not c.get("id"):
+                continue
+            ch = str(c["id"])
+            last = state.get("slack", {}).get(ch)
+            if last is None:                                   # first look: start from now, do not wake for old history
+                new["slack"][ch] = f"{now:.6f}"
+                continue
+            r = api_get("conversations.history", {"channel": ch, "oldest": last, "limit": 30}, tok, base)
+            if not r.get("ok"):
+                continue                                       # not readable by the bot: skipped
+            dm = c.get("key") in ("owner-dm", "owner-dm-reply")
+            def for_me(m):    # in a team channel only a message that tags/names the agents or the owner counts; the owner DM: everything
+                t = (m.get("text") or "").lower()
+                return dm or any(x and x.lower() in t for x in mine)
+            fresh = [m for m in r.get("messages", []) if not m.get("bot_id") and m.get("user") != bot and not m.get("subtype") and for_me(m)]
+            for m in r.get("messages", []):                    # replies in a thread whose parent is older (a thread that is about me or started by the bot)
+                if float(m.get("latest_reply", 0) or 0) > float(last) and m.get("latest_reply_user") != bot and (for_me(m) or m.get("bot_id")):
+                    fresh.append(m)
+            if fresh:
+                reasons.append(f"slack {c.get('key') or ch}")
+            new["slack"][ch] = f"{now:.6f}"
+    role = pairconf.role(cfg)
+    here = pathlib.Path(__file__).resolve().parent
+    try:
+        out = subprocess.run([sys.executable, str(here / "handoff"), "list", "--for", role], capture_output=True, text=True, timeout=40).stdout
+    except Exception:
+        out = ""
+    sig = hashlib.sha1(out.encode()).hexdigest()
+    new["handoffs"] = sig
+    if state.get("handoffs") not in (None, "") and sig != state.get("handoffs"):
+        reasons.append("hand-over change")
+    return reasons, new
+
+
+def main():
+    if "--selftest" in sys.argv:
+        return selftest()
+    cfg = pairconf.load()
+    state, now = load_state(), time.time()
+    reasons, new = scan(cfg, state, now)
+    if "--ack" in sys.argv:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(new))
+        print("acknowledged")
+        return 0
+    if not state:                                              # very first run: just record the starting point
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(new))
+        print("quiet (first run)")
+        return 1
+    if reasons:
+        print("wake: " + ", ".join(reasons))
+        return 0
+    print("quiet")
+    return 1
+
+
+def selftest():
+    print("selftest lives in kit/tests/test_wake_check.py")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
