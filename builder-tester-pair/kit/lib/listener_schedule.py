@@ -58,7 +58,9 @@ def decide(sched, now_utc=None):
     now = (now_utc or datetime.datetime.now(datetime.timezone.utc)).astimezone(tz)
     for w in windows:
         if isinstance(w, dict) and window_matches(w, now):
-            if str(w.get("mode", "every")).lower() == "off":
+            mode = w.get("mode", "every")
+            # YAML 1.1 reads an unquoted `off` as the boolean False (and `on` as True): accept both spellings
+            if mode is False or str(mode).lower() in ("off", "false", "no", "none", "stop"):
                 return ("off", 0)
             return ("every", int(w.get("minutes") or default))
     return ("every", default)
@@ -89,6 +91,11 @@ def selftest():
         got = decide(wrap, datetime.datetime.strptime(t, "%Y-%m-%d %H:%M").replace(tzinfo=datetime.timezone.utc))
         bad += got != want
         print("PASS" if got == want else "FAIL", "wrap", t, got)
+    yaml_off = {"timezone": "UTC", "listener_windows": [{"days": ["sat"], "mode": False}, {"mode": "every", "minutes": 45}]}   # what an unquoted `off` parses to
+    for t, want in (("2026-10-17 12:00", ("off", 0)), ("2026-10-14 12:00", ("every", 45))):
+        got = decide(yaml_off, datetime.datetime.strptime(t, "%Y-%m-%d %H:%M").replace(tzinfo=datetime.timezone.utc))
+        bad += got != want
+        print("PASS" if got == want else "FAIL", "yaml off=False", t, got)
     got = decide({"tick_minutes": 10})
     bad += got != ("every", 10)
     print("PASS" if got == ("every", 10) else "FAIL", "no windows -> every tick_minutes", got)
