@@ -46,7 +46,7 @@ if "--selftest" in sys.argv:
     sess = ARG + "us/sess" + "ion.json"
     with open(cfgp, "w") as f:
         f.write(CFG_TEXT := f"""project: {{name: Acme, slug: acme}}
-owner: {{name: Jane Doe, email: jane@example.com, teams_user_id: "11111111-2222-3333-4444-555555555555", slack_user_id: U0TESTJANE}}
+owner: {{name: Jane Doe, email: jane@example.com, teams_user_id: "{"11111111-2222-3333-4444-" + "555555555555"}", slack_user_id: U0TESTJANE}}
 builder: {{name: Forge, workspace: acme-builder, host: bt-builder}}
 tester: {{name: Sentinel, workspace: acme-tester, host: bt-tester, k8s_namespace: jane-acme-tester-01, kits_dir: "~/{kd}", private_dir: "~/sentinel-private"}}
 paths: {{shared_root: {tmp}, ledger: {led}}}
@@ -76,7 +76,7 @@ guard: {{blocked_hosts: [evil.example.net]}}
         (0, "bt-tester", B("wc -c ~/.config/argus/tokens/api.author")),
         (2, "bt-tester", B("kubectl --context x ap" + "ply -f out/" + ex)),
         (0, "bt-tester", B("kubectl --context x create -f out/" + ex)),
-        (2, "bt-builder", R("/home/u/.config/argus/session.json")),
+        (2, "bt-builder", R(tmp + "/.config/argus/session.json")),
         (2, "bt-builder", B(f"git -C checker archive HEAD {k} | tar -xO")),
         (2, "bt-builder", B(f"git -C checker log -p -- {k}")),
         (2, "bt-builder", B("git clone https://github.com/acme/acme-checker.git /tmp/full")),
@@ -92,7 +92,7 @@ guard: {{blocked_hosts: [evil.example.net]}}
         (2, "bt-builder", B(f"ls {adir}; {tmp}/kit/bin/{appr} api-namespace 60")),
         (0, "bt-builder", B(f"{tmp}/kit/bin/{appr} --list")),
         (0, "bt-builder", B(f"ls {adir}")),
-        (2, "bt-builder", {"tool_name": "Edit", "tool_input": {"file_path": "/home/u/.claude/settings.json", "old_string": "{", "new_string": "{\"env\":{\"PAIR_APPROVALS_DIR\":\"/tmp/m\"},"}}),
+        (2, "bt-builder", {"tool_name": "Edit", "tool_input": {"file_path": tmp + "/.claude/settings.json", "old_string": "{", "new_string": "{\"env\":{\"PAIR_APPROVALS_DIR\":\"/tmp/m\"},"}}),
         # the tester's workspace and pod
         (2, "bt-builder", B(f"coder {REMOTE_LOGIN} acme-tester -- cp ~/{ARG}us/tokens/api.author /tmp/x")),
         (2, "bt-builder", B(f"coder {REMOTE_COPY} acme-tester:{ARG}us/session.json /tmp/s")),
@@ -217,7 +217,7 @@ guard: {{blocked_hosts: [evil.example.net]}}
         (2, "bt-builder", B(f"python3 - <<'EOF'\nopen('pair.yaml','w').write(open('{k}/api/scenarios/a.md').read())\nEOF")),
     ]
     with open(os.path.join(tmp, "grab.sh"), "w") as f:
-        f.write("kubectl exec -n jane-acme-" + "tester-01 deploy/x -- wc -c /home/u/.profile\n")
+        f.write("kubectl exec -n jane-acme-" + "tester-01 deploy/x -- wc -c ~/.profile\n")
     log = os.path.join(tmp, "blocks.jsonl"); open(log, "w").close()
     bad = 0
     for want, host, e in cases:
@@ -771,6 +771,16 @@ if not tester:
     promote = tool in ("Edit", "Write") and "settings.json" in str(ti.get("file_path", "")) and \
         re.search(r"PAIR_GUARD_TEST_HOST|PAIR_CONFIG", blob)
     web_hit = tool == "WebFetch" and bool(REPO_RX) and re.search(r"(" + REPO_RX + r")[^ ]*/(tree|blob|raw)/[^ ]*kits", str(ti.get("url", "")))
+    # Same-workspace stand-in (tester runs as another Linux user here): the builder must not become that user or open
+    # its home. With the tester in its own workspace neither can happen, so both checks are off unless configured.
+    _esc = tool == "Bash" and G("guard.block_privilege_escalation", False) is True and re.search(
+        r"(?:^|[;&|(`\n\r'\"]|\$\(|\bxargs\s+|\benv\s+|\bexec\s+|\bcommand\s+|\b(?:ba|z|da)?sh\s+-\w*c\s+)\s*(?:[\w.~-]*/)*(?:sudo|su|doas|runuser|pkexec|nsenter|setpriv)\b", cmd)
+    _th = os.path.expanduser(str(G("tester.agent_home") or "")).rstrip("/")
+    _home_hit = bool(_th) and G("tester.user") and _th in (paths + " " + cmd + " " + str(ti.get("file_path", "")))
+    if _esc or _home_hit:
+        block(f"BLOCKED (pair-guard): HOLDOUT. {TESTER} runs in this workspace as its own Linux user. The builder may "
+              f"not use sudo/su/doas to become another user, nor open {TESTER}'s home folder. If you need a "
+              f"privileged step, put it in the hand-over under 'Needs you'.")
     if clone_hit or glob_hit or glob_tool or promote or web_hit:
         block(f"BLOCKED (pair-guard): HOLDOUT. The builder may not clone the checker repos, reach kits/ by glob or "
               f"URL, or make itself the tester ({TESTER} is {TESTER_HOST or 'the tester host'}, set in pair.yaml).")

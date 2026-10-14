@@ -58,6 +58,18 @@ editing approval tools). The owner copies their organisation's approved version 
 writes one: `approve-deploy <scope> [minutes]`, `--list`, `--revoke-all`; scope at least 6 characters; at most 480
 minutes; files under `paths.approvals` written with umask 077) and re-runs `./install.sh`. `./setup` reminds you.
 
+**What the approval window is, and is not.** The read-only cluster credential (`k8s/agent-readonly.yaml`, applied by the owner with
+`kit/scripts/make-agent-kubeconfig.sh`) is the BOUNDARY: a token that cannot write fails every write however it is spelled. The approval window and the
+deploy-gate regexes are a TRIPWIRE on top, not a boundary:
+- `deploy-gate` honours any well-formed `appr-*.json` in `paths.approvals` (by, created, unexpired expires, a scope of 6+ characters); it cannot tell who
+  wrote the file. If the builder's Linux user can write that directory, the party the window restrains can open its own window. This is the case when
+  the ledger lives on a shared disk that both workspaces mount under the same uid (mode bits then isolate nothing, `drwx------` included).
+- Check it for YOUR deployment, as the builder's user: `test -w <paths.approvals> && echo "WRITABLE: the window is only a tripwire here"`. If it is
+  writable, put `paths.approvals` where the builder cannot write (a different owner, or a different filesystem the builder mounts read-only), or accept
+  that the control is the read-only credential plus the builder's own instructions.
+- The 6-character minimum for a scope is enforced in BOTH `deploy-gate.py` and the chat approval step, deliberately. Consequence: a namespace such as
+  `dev`, `api` or `prod` can never be approved by any path, chat or command. If you need that, change the bound in both places; do not change one.
+
 ## Steps
 
 1. **Clone the kit into the shared folder** (once):
@@ -119,6 +131,40 @@ minutes; files under `paths.approvals` written with umask 077) and re-runs `./in
       `snapshots/<ts>` with ArtifactData; the page shows the newest one live (`db` capability, owner-only writes).
       Titles and names (project, owner, builder, tester) and the stale warning (`schedule.stall_minutes`, else 45)
       come from the snapshot; nothing person-specific is in the HTML.
+
+## Two ways to deploy: separate workspaces or one (`guard.workspace_mode`)
+
+| `guard.workspace_mode` | Use when | What it means |
+|---|---|---|
+| `separate` (default) | builder and tester each have their own workspace | The hand-over tools demand proof of an untampered environment (same namespaces as PID 1) and fail closed. The wall between the agents is a real one. |
+| `single` | both agents run in ONE workspace | The same check compares with the oldest readable process of the agent's own user, because one agent can never read PID 1. It still catches a process that really unshared. The agents share an account's rights, so treat it as a tripwire, not a wall; keep the guards below on. |
+
+Switching is one line in `pair.yaml` plus the steps in the next two sections; no code changes.
+
+## The tester in the SAME workspace (`guard.workspace_mode: single`, as another Linux user)
+
+Until a tester workspace exists you can run the tester next to the builder. It is weaker than two workspaces — treat
+a PASS from it as provisional — but the tester's tests, tokens and sign-ins stay out of the builder's reach:
+
+1. Give each role a Linux user in `pair.yaml`: `builder.user` (the current account), `tester.user` + `tester.uid`
+   (fixed, e.g. 2101), `tester.agent_home` (private home, mode 700), and set `tester.host` to the SAME host pattern as the
+   builder. Roles are then told apart by user (`pairconf.role`).
+2. `paths.share_group: pairshare` and `guard.block_privilege_escalation: true` (the builder may not `sudo`/`su` or open
+   the tester's home).
+3. Owner, with sudo: `bash kit/scripts/tester-users.sh` (idempotent; re-run after a pod rebuild — users vanish with the pod,
+   the home folders and their ownership survive because the uid is fixed).
+4. Install the tester AS that user: `sudo -u <tester.user> -H env PAIR_CONFIG=<pair.yaml> bash install.sh`, then its own
+   sign-ins (Claude, `gh`, Argus author tokens — device codes, you approve), then `start-agent.sh` as that user.
+
+Limit: the account still has passwordless sudo, which a guard hook cannot make unreachable. That is why this is a stand-in.
+
+### Moving the tester to its own workspace later
+
+Nothing is rebuilt. Create the workspace, then: (a) in `pair.yaml` set `tester.host` to `coder-<new workspace id>-*`, delete
+`tester.user`, `tester.uid`, `paths.share_group` and `guard.block_privilege_escalation`; (b) in the new workspace run
+`./setup --steps` (same shared folder, so the same `pair.yaml`); (c) sign the tester in there; (d) stop the tester here
+(`tmux kill-session -t watchdog-<name>; tmux kill-session -t <name>` as that user) and remove its user and home.
+The builder side needs only `./setup-pair render` and a restart.
 
 ## A brand-new or rebuilt workspace
 
