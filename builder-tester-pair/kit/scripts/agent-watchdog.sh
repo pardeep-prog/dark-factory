@@ -139,7 +139,7 @@ poke() {   # poke "<why>": one tick, only when the agent is idle (otherwise it i
   touch "$LAST_POKE"
   python3 "$KIT/kit/bin/wake-check" --ack >/dev/null 2>&1
 }
-agent_idle60() { local last; last="$(tmux display -p -t "$NAME" '#{window_activity}' 2>/dev/null)"; [ -n "$last" ] && [ $(( $(date +%s) - last )) -ge 60 ]; }
+agent_idle60() { local last; last="$(tmux display -p -t "$NAME" '#{window_activity}' 2>/dev/null)"; [ -n "$last" ] && [ $(( $(date +%s) - last )) -ge 60 ] && ledger_idle; }
 wake_tick() {
   [ -n "$WAKE_ON" ] || return 0
   [ "${SCHED_WANT:-every}" = off ] && return 0
@@ -155,7 +155,11 @@ wake_tick() {
   case "$out" in wake:*) poke "${out#wake: }" ;; esac
 }
 MODE_FILE="$HOME/.cache/agent-watchdog.mode"
-agent_idle() { local last; last="$(tmux display -p -t "$NAME" '#{window_activity}' 2>/dev/null)"; [ -n "$last" ] && [ $(( $(date +%s) - last )) -ge 180 ]; }
+# Idle = the pane has been silent for 3 minutes AND the action ledger says no work is in flight (kit/bin/agent-busy). A silent pane alone is not
+# idle: a long tool call, build or slow model response prints nothing, and stopping it at a schedule boundary would kill an agent mid-task.
+# agent-busy exits 1 only for "idle"; 0 (busy) and 2 (unknown) both count as NOT idle.
+ledger_idle() { python3 "$KIT/kit/bin/agent-busy" >/dev/null 2>&1; [ $? -eq 1 ]; }
+agent_idle() { local last; last="$(tmux display -p -t "$NAME" '#{window_activity}' 2>/dev/null)"; [ -n "$last" ] && [ $(( $(date +%s) - last )) -ge 180 ] && ledger_idle; }
 SCHED_WANT=""
 schedule_tick() {   # sets SCHED_WANT ("off" or "every N"); returns 1 when the agent must stay stopped
   [ -n "$SCHED_ON" ] || return 0
@@ -189,6 +193,7 @@ is_fresh_hour() { for h in $HOURS; do [ "$(date -u +%H)" = "$h" ] && return 0; d
 log "watchdog started for $NAME ($ROLE)"
 n=0
 while true; do
+  touch "$HOME/.cache/agent-watchdog.alive"      # `agents.sh status` shows watchdog=STALLED when this is older than 10 minutes
   check_restart_request
   argus_keepalive
   asks_check
