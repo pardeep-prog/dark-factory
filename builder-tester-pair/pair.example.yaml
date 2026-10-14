@@ -186,6 +186,7 @@ argus:                          # optional: independent end-to-end checker (kit/
   control_namespace: ""         # namespace of the control plane (holds the registry pull secret)
   instance_suffix: "dev"        # instance ids are <app>-<suffix>
   egress_script: ""             # path inside the Argus source to its egress allow-list script, optional
+  ingress_ip: ""                # IP of YOUR Argus ingress (`argus.sh setup` fetches the TLS certificate from it); required for `setup`, or set ARGUS_INGRESS_IP
   existing_suites: []           # [{app: api, owner: "Team X"}] — reuse once the owner OKs, never duplicate
 
 schedule:
