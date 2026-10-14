@@ -3,6 +3,20 @@
 # decided by hostname in pair.yaml) in the shared root with `claude --permission-mode auto "/<start_command>"`.
 # Detach with Ctrl-b then d; it keeps running. Run again after a workspace rebuild.
 set -euo pipefail
+# ONE-SHOT mode (`--once --task "<what to do>"` or `--task-file FILE`): NO watchdog and NO repeating listener loop. The agent does its setup
+# check, works through the task and stops, so nothing keeps spending tokens afterwards. Use it to clear a queue (for example every open
+# request) without leaving the 3-minute check-in running; the normal command (no flags) is unchanged.
+ONCE=0; TASK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once) ONCE=1 ;;
+    --task) TASK="${2:-}"; shift ;;
+    --task-file) TASK="$(cat "${2:-/dev/null}")"; shift ;;
+    *) echo "unknown option $1 (use --once --task \"...\" or --once --task-file FILE)"; exit 2 ;;
+  esac
+  shift
+done
+[ "$ONCE" = 1 ] && [ -z "$TASK" ] && { echo "--once needs --task \"...\" or --task-file FILE"; exit 2; }
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PC() { python3 "$KIT/kit/lib/pairconf.py" "$@"; }
 ROLE="$(PC role)"
@@ -10,7 +24,8 @@ case "$ROLE" in builder|tester) ;; *) echo "This host ($(hostname)) is neither b
 # tmux session name: the agent's name as a slug ("Test Agent" -> test-agent), so it is one safe word everywhere
 NAME="$(PC get "$ROLE.name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^-+|-+$//g')"
 NAME="${NAME:-$ROLE}"
-CMD="/$(PC get "$ROLE.start_command")"
+START_CMD="$(PC get "$ROLE.start_command")"
+CMD="/$START_CMD"
 ROOT="$(PC get paths.shared_root)"
 # Optional per-agent HOME (`<role>.agent_home`): lets several pairs share one workspace. See agent-home.sh.
 CFG="$(PC path)"
@@ -28,7 +43,11 @@ if [ -n "$SG" ] && [ -z "${PAIR_SG_REEXEC:-}" ] && ! id -nG | tr ' ' '\n' | grep
 fi
 UMASK_PFX=""; [ -n "$SG" ] && UMASK_PFX="umask 002; "
 WD="watchdog-$NAME"   # one watchdog per agent, so two agents in a workspace never share (or stop) each other's
-tmux has-session -t "$WD" 2>/dev/null || tmux new -d -c "$ROOT" -s "$WD" "HOME=$(printf %q "$HOME") PAIR_CONFIG=$(printf %q "$CFG") bash $KIT/kit/scripts/agent-watchdog.sh"
+if [ "$ONCE" = 0 ]; then
+  tmux has-session -t "$WD" 2>/dev/null || tmux new -d -c "$ROOT" -s "$WD" "HOME=$(printf %q "$HOME") PAIR_CONFIG=$(printf %q "$CFG") bash $KIT/kit/scripts/agent-watchdog.sh"
+else
+  CMD="Do your normal setup check and read your rules (the steps of ~/.claude/commands/${START_CMD}.md), but do NOT start the repeating listener loop, schedule no recurring job, and start no watchdog. Then do exactly this task and nothing more, following the usual hand-over flow with your counterpart (use the handoff tool; if you must wait for the other agent, check 'handoff list' about every 5 minutes with sleep, no faster). When the task is done, or you are blocked, write a short summary, tell the owner in the owner DM as your rules say, and stop. TASK: ${TASK}"
+fi
 if [ -t 0 ] && [ -t 1 ]; then ATTACH=1; else ATTACH=0; fi   # no terminal (e.g. `! …` from Claude): start detached
 if tmux has-session -t "$NAME" 2>/dev/null; then
   [ "$ATTACH" = 1 ] && exec tmux attach -t "$NAME"
