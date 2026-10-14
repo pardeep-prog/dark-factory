@@ -190,6 +190,18 @@ argus:                          # optional: independent end-to-end checker (kit/
 
 schedule:
   tick_minutes: 3               # how often each agent checks chats and hand-overs
+  # Optional: WHEN the check-in runs (kit/lib/listener_schedule.py; the watchdog follows it every minute, at no token cost).
+  # First matching window wins; nothing matches = every tick_minutes; no windows at all = always every tick_minutes.
+  # timezone: Asia/Kolkata
+  # listener_windows:
+  #   - {days: [sat, sun], mode: off}                 # weekends: no listener
+  #   - {from: "10:00", to: "19:00", mode: off}       # the owner's working day: no listener
+  #   - {mode: every, minutes: 45}                    # otherwise a check-in every 45 minutes
+  # MINIMUM-TOKEN MODE: with `wake_on_change: true` the agent runs NO repeating loop. It sits idle (no tokens) and the watchdog, with a script
+  # (kit/bin/wake-check: new Slack messages for the agents or the owner, new hand-over states), sends it ONE tick only when something is new,
+  # plus a heartbeat tick every wake_heartbeat_minutes and one at digest_utc. Combine with the windows above for off hours and weekends.
+  # wake_on_change: true
+  # wake_heartbeat_minutes: 120
   fresh_start_utc: ["02", "14"] # hours when the watchdog replaces each agent with a fresh process
   stall_minutes: 45             # builder only: restart if its dashboard snapshot is older (0 = off)
 

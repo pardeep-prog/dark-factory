@@ -202,6 +202,26 @@ need (shown on the dashboard's "Needs you") for each request that is older than 
 quoted in a hand-over (max 3 new per run). It lists channels the bot cannot read ("invite the app there"); the bot must be a member of
 a channel for the check, the attachment download and a reply to work. Run it by hand any time: `slack-asks --grace-min 30`.
 
+## When the check-in runs (`schedule.listener_windows`)
+
+By default each agent's repeating check-in runs every `schedule.tick_minutes`, day and night. To save tokens and to leave your working hours and weekends
+alone, add windows to `pair.yaml` (see `pair.example.yaml`): the first window that matches the current time (in `schedule.timezone`) decides, as
+`mode: off` (no check-in; the agent is stopped only when it is IDLE: its terminal has been silent for 3 minutes AND `kit/bin/agent-busy` finds no work in
+flight in the action ledger, meaning no entry newer than 5 minutes and no tool call started in the last 45 minutes that has not finished, so a long build
+or test battery is never killed at a schedule boundary) or `mode: every, minutes: N`. The watchdog checks every minute with
+a shell loop (no model, no tokens), starts the agent when a window needs it and restarts it when the interval changes. `python3 kit/lib/listener_schedule.py`
+prints what applies now; `--at "2026-10-14 11:00"` shows any local time. No windows = nothing changes. To work with an agent by hand during an off
+window, start it with `start-agent.sh --once --task "..."` (no watchdog, no loop). The watchdog touches `~/.cache/agent-watchdog.alive` every minute and
+`agents.sh status` shows `watchdog=STALLED` (plus an ACTION line) when that file is more than 10 minutes old: in wake-on-change mode the watchdog is the only
+thing that ticks the agent, so a stuck watchdog must not be silent.
+
+**Minimum-token mode (`schedule.wake_on_change: true`).** The biggest cost of a repeating check-in is that every idle tick still calls the model. In this
+mode there is no repeating loop at all: the agent is started with interval 0 and sits idle, and the watchdog runs `kit/bin/wake-check` every 2 minutes (a script:
+new Slack messages that tag or name the agents or the owner, any new message in the owner DM, new hand-over states, using the bot token, read only). Only when it
+reports something new does the watchdog type one `/channel-listener tick` into the idle agent. A heartbeat tick every `schedule.wake_heartbeat_minutes`
+(default 120) and one at `schedule.digest_utc` keep the periodic jobs (dashboard, morning digest, knowledge refresh) running. An agent that is busy is never
+interrupted: it reads the new items on its own next tick.
+
 ## Asking the owner in Slack (`owner_decisions`, the `owner-dm` watch channel)
 
 The owner is not sitting in the agents' terminals, so a question asked only there is never seen. The `owner_decisions` rule makes the agent

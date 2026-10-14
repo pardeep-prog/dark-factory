@@ -59,6 +59,12 @@ for CFG in "$PAIRS_DIR"/*/pair.yaml; do
       status)  a=down; w=down; l=-; up "$user" "$home" "$name" && a=UP; up "$user" "$home" "watchdog-$name" && w=UP
                # A session can be UP while the agent inside does nothing: its Claude login expired (the screen says
                # "Login expired · Please run /login"). A watchdog restart cannot fix that, only the owner's /login can.
+               # A watchdog tmux session can also be UP while its loop is stuck (it touches ~/.cache/agent-watchdog.alive every minute).
+               # In wake-on-change mode the watchdog is the ONLY thing that ticks the agent, so a stuck one must show up here.
+               if [ "$w" = UP ]; then
+                 alive="$home/.cache/agent-watchdog.alive"
+                 as_user "$user" "$home" test -f "$alive" && [ $(( $(date +%s) - $(as_user "$user" "$home" stat -c %Y "$alive" 2>/dev/null || echo 0) )) -gt 600 ] && w=STALLED
+               fi
                if [ "$a" = UP ]; then
                  if as_user "$user" "$home" tmux capture-pane -p -t "$name" -S -40 2>/dev/null | tail -n 25 \
                       | grep -qiE 'login expired|please run /login|invalid api key|oauth token has expired|not logged in'; then
@@ -66,6 +72,7 @@ for CFG in "$PAIRS_DIR"/*/pair.yaml; do
                fi
                ROWS+=("$(printf '%-12s %-9s %-8s %-8s agent=%-4s watchdog=%-4s login=%s' "$name" "$role" "$pair" "$user" "$a" "$w" "$l")")
                [ "$a" = UP ] && [ "$w" = UP ] && [ "$l" != EXPIRED ] || PROBLEMS=$((PROBLEMS+1))
+               [ "$w" != STALLED ] || echo "ACTION: $name's watchdog loop has not run for 10+ minutes. Restart it: agents.sh restart $name" >&2
                [ "$l" != EXPIRED ] || echo "ACTION: $name's Claude login expired. As the owner: tmux attach -t $name (as $user), run /login, then Ctrl+B D" >&2 ;;
     esac
   done

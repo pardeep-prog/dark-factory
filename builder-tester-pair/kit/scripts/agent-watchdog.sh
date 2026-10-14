@@ -29,7 +29,9 @@ STALL_COOLDOWN_MIN=120
 UMASK_PFX=""; [ -n "$(PC get paths.share_group)" ] && UMASK_PFX="umask 002; "   # builder+tester as 2 users in one workspace
 PMODE="$(PC get "$ROLE.permission_mode")"; PMODE="${PMODE:-auto}"     # same setting as start-agent.sh
 case "$PMODE" in auto|bypassPermissions|acceptEdits|default|plan) ;; *) PMODE=auto ;; esac
-printf -v LAUNCH '%sHOME=%q PAIR_CONFIG=%q PAIR_AGENT_SESSION=%q claude --permission-mode %q %q; exec bash' "$UMASK_PFX" "$HOME" "$(PC path)" "$NAME" "$PMODE" "$CMD"
+# mk_launch [N]: the launch command; N (a number) becomes the argument of the start command = the check-in interval in minutes
+mk_launch() { printf -v LAUNCH '%sHOME=%q PAIR_CONFIG=%q PAIR_AGENT_SESSION=%q claude --permission-mode %q %q; exec bash' "$UMASK_PFX" "$HOME" "$(PC path)" "$NAME" "$PMODE" "$CMD${1:+ $1}"; }
+mk_launch ""
 LOG="$HOME/.cache/agent-watchdog.log"; mkdir -p "$(dirname "$LOG")"
 STAMP="$HOME/.cache/agent-watchdog.last-refresh"
 LAST_STALL="$HOME/.cache/agent-watchdog.last-stall-refresh"
@@ -115,6 +117,67 @@ asks_check() {
   log "slack-asks: ${out:-no output}"
 }
 
+# Listener schedule (optional): schedule.listener_windows in pair.yaml (kit/lib/listener_schedule.py). Every minute this shell loop (no model, no
+# tokens) asks what the schedule says now: "off" = stop the agent once it is idle (no screen output for 3 min), so nothing runs while the
+# owner works by hand or at weekends; "every N" = keep the agent running with an N-minute check-in (a different N than the running one =
+# a fresh start with the new interval, once idle). No windows configured = this does nothing and the old behaviour stays.
+SCHED_ON=""; [ -n "$(PC get schedule.listener_windows)" ] && SCHED_ON=1
+# WAKE ON CHANGE (schedule.wake_on_change: true) = the minimum-token mode: the agent is started with NO repeating loop (argument 0) and sits
+# idle at zero cost; this shell loop runs kit/bin/wake-check every 2 minutes (Slack for the bot and owner, the hand-over list: no model) and
+# types one `/channel-listener tick` into the idle agent only when something is new, plus a heartbeat tick every
+# schedule.wake_heartbeat_minutes (default 120) and one at the morning digest time, for the periodic jobs. Works together with the windows above.
+WAKE_ON=""; [ "$(PC get schedule.wake_on_change)" = "True" ] || [ "$(PC get schedule.wake_on_change)" = "true" ] && WAKE_ON=1
+WAKE_HB="$(PC get schedule.wake_heartbeat_minutes)"; WAKE_HB="${WAKE_HB:-120}"
+DIGEST_AT="$(PC get schedule.digest_utc)"
+LAST_WAKE_CHECK="$HOME/.cache/agent-watchdog.last-wake-check"; LAST_POKE="$HOME/.cache/agent-watchdog.last-poke"; LAST_DIGEST_POKE="$HOME/.cache/agent-watchdog.last-digest-poke"
+[ -n "$WAKE_ON" ] && mk_launch 0
+poke() {   # poke "<why>": one tick, only when the agent is idle (otherwise it is already working and will read the new items itself)
+  tmux has-session -t "$NAME" 2>/dev/null || return 0
+  agent_idle60 || return 0
+  log "wake: $1 — sending one /channel-listener tick"
+  tmux send-keys -t "$NAME" "/channel-listener tick" Enter
+  touch "$LAST_POKE"
+  python3 "$KIT/kit/bin/wake-check" --ack >/dev/null 2>&1
+}
+agent_idle60() { local last; last="$(tmux display -p -t "$NAME" '#{window_activity}' 2>/dev/null)"; [ -n "$last" ] && [ $(( $(date +%s) - last )) -ge 60 ] && ledger_idle; }
+wake_tick() {
+  [ -n "$WAKE_ON" ] || return 0
+  [ "${SCHED_WANT:-every}" = off ] && return 0
+  tmux has-session -t "$NAME" 2>/dev/null || return 0
+  if [ -n "$DIGEST_AT" ] && [ "$(cat "$LAST_DIGEST_POKE" 2>/dev/null)" != "$(date -u +%F)" ]; then
+    local nowm digm; nowm=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) )); digm=$(( 10#${DIGEST_AT%:*} * 60 + 10#${DIGEST_AT#*:} ))
+    if [ "$nowm" -ge "$digm" ] && [ "$nowm" -lt $(( digm + 30 )) ]; then date -u +%F > "$LAST_DIGEST_POKE"; poke "digest time"; return 0; fi
+  fi
+  if [ "$(age_min "$LAST_POKE")" -ge "$WAKE_HB" ]; then poke "heartbeat (${WAKE_HB} min)"; return 0; fi
+  [ "$(age_min "$LAST_WAKE_CHECK")" -ge 2 ] || return 0
+  touch "$LAST_WAKE_CHECK"
+  local out; out="$(timeout 90 python3 "$KIT/kit/bin/wake-check" 2>/dev/null)"
+  case "$out" in wake:*) poke "${out#wake: }" ;; esac
+}
+MODE_FILE="$HOME/.cache/agent-watchdog.mode"
+# Idle = the pane has been silent for 3 minutes AND the action ledger says no work is in flight (kit/bin/agent-busy). A silent pane alone is not
+# idle: a long tool call, build or slow model response prints nothing, and stopping it at a schedule boundary would kill an agent mid-task.
+# agent-busy exits 1 only for "idle"; 0 (busy) and 2 (unknown) both count as NOT idle.
+ledger_idle() { python3 "$KIT/kit/bin/agent-busy" >/dev/null 2>&1; [ $? -eq 1 ]; }
+agent_idle() { local last; last="$(tmux display -p -t "$NAME" '#{window_activity}' 2>/dev/null)"; [ -n "$last" ] && [ $(( $(date +%s) - last )) -ge 180 ] && ledger_idle; }
+SCHED_WANT=""
+schedule_tick() {   # sets SCHED_WANT ("off" or "every N"); returns 1 when the agent must stay stopped
+  [ -n "$SCHED_ON" ] || return 0
+  SCHED_WANT="$(python3 "$KIT/kit/lib/listener_schedule.py" 2>/dev/null)"; [ -n "$SCHED_WANT" ] || return 0
+  local running=0; tmux has-session -t "$NAME" 2>/dev/null && running=1
+  if [ "$SCHED_WANT" = off ]; then
+    if [ "$running" = 1 ] && agent_idle; then log "schedule: off window, agent idle — stopping $NAME"; release_lock; tmux kill-session -t "$NAME"; fi
+    echo off > "$MODE_FILE"; return 1
+  fi
+  local n="${SCHED_WANT#every }"; [ -n "$WAKE_ON" ] && n=0; mk_launch "$n"
+  if [ "$running" = 0 ]; then
+    log "schedule: $SCHED_WANT — starting $CMD $n"; release_lock; tmux new -d -c "$ROOT" -s "$NAME" "$LAUNCH"; echo "$SCHED_WANT" > "$MODE_FILE"; date -u +%F-%H > "$STAMP"
+  elif [ "$(cat "$MODE_FILE" 2>/dev/null)" != "$SCHED_WANT" ] && agent_idle; then
+    log "schedule: now $SCHED_WANT — fresh $CMD $n"; refresh; echo "$SCHED_WANT" > "$MODE_FILE"; date -u +%F-%H > "$STAMP"
+  fi
+  return 0
+}
+
 # Owner approvals typed in Slack (BUILDER only): every minute `chat-approval scan` reads the owner's DM with the bot (bot token, read only) and turns
 # an exact "approve <namespace> <minutes>" from the OWNER's account into a deploy window, then confirms in that DM. Runs here, in a kit process,
 # so the owner's message is enough and the agent never touches an approval. Skipped when there is no bot token or no owner-dm channel.
@@ -130,11 +193,14 @@ is_fresh_hour() { for h in $HOURS; do [ "$(date -u +%H)" = "$h" ] && return 0; d
 log "watchdog started for $NAME ($ROLE)"
 n=0
 while true; do
+  touch "$HOME/.cache/agent-watchdog.alive"      # `agents.sh status` shows watchdog=STALLED when this is older than 10 minutes
   check_restart_request
   argus_keepalive
   asks_check
   approvals_scan
-  if [ $(( n++% 10 )) -ne 0 ]; then sleep 60; continue; fi
+  schedule_tick || { sleep 60; continue; }
+  wake_tick
+  if [ $(( n++ % 10 )) -ne 0 ]; then sleep 60; continue; fi
   if ! tmux has-session -t "$NAME" 2>/dev/null; then
     log "session $NAME missing — starting $CMD"
     release_lock
