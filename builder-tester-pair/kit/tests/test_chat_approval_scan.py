@@ -116,6 +116,23 @@ class Scan(unittest.TestCase):
         self.run_("chat-approval", "scan")
         self.assertEqual(len(self.windows()), 1)
 
+    def test_a_refused_attempt_is_answered_once_and_never_by_silence(self):
+        STATE["messages"] = [msg("approve dev 30"), msg("approve chairside-dev 500")]
+        self.run_("chat-approval", "scan")
+        self.assertEqual(self.windows(), [])
+        texts = [p["text"] for p in STATE["posts"]]
+        self.assertEqual(len(texts), 2, texts)
+        self.assertTrue(any("shorter than 6 characters" in t for t in texts), "a short but valid name gets its own reason")
+        self.assertTrue(any("minutes must be" in t for t in texts))
+        STATE["posts"].clear()
+        self.run_("chat-approval", "scan")
+        self.assertEqual(STATE["posts"], [], "the same refusal must not be repeated on every scan")
+
+    def test_only_the_owners_attempts_are_answered(self):
+        STATE["messages"] = [msg("approve chairside-dev 30", user="U0SOMEONE"), msg("approve chairside-dev 30", bot_id="B0BOT", user="U0BOT")]
+        self.run_("chat-approval", "scan")
+        self.assertEqual((self.windows(), STATE["posts"]), ([], []), "other people's and the bot's messages get no window and no reply")
+
     def test_deploy_window_is_read_only_and_tells_the_truth(self):
         r = self.run_("deploy-window", "chairside-dev")
         self.assertEqual((r.returncode, r.stdout.strip()), (1, "closed"))

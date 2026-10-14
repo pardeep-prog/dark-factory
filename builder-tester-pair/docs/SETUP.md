@@ -219,6 +219,18 @@ The builder's watchdog runs `kit/bin/chat-approval scan` every minute: it reads 
 owner's own Slack user (an agent holding only the bot token cannot post as the owner), uses each message once, opens the window and confirms in the DM.
 The bot needs the `im:history` scope. `kit/bin/deploy-window [<namespace>]` is a read-only check agents use to see whether a window is open. Nothing here
 lets an agent open or edit a window; typing the approval command in the workspace is still the strongest path.
+A refused attempt is answered in the DM once, with the reason (silence would look like "window open"). A namespace shorter than 6 characters is
+refused with its own reason, because the deploy gate only honours scopes of 6 or more characters.
+
+**What this does and does not protect (read before relying on it).**
+- *The approval record's authority is the directory.* A window is just a file in `paths.approvals`. Where the builder and the watchdog run as the SAME
+  Linux user, an agent can write such a file itself, so the chat path is not the weakest link there; the pair-guard rules against editing approvals
+  are the control, and they are a tripwire. Run the builder as a different user from the owner's if you need more.
+- *"An agent cannot set the author" holds for an agent that has only the bot token.* It does NOT hold if an agent can reach a Slack connector that posts
+  under the owner's own OAuth identity: such a post carries `user` = the owner and no `bot_id`, the shape this check accepts. A 2026-09-23
+  measurement in one estate recorded agent posts appearing as the owner. Before trusting this path, verify in YOUR estate: post one test message
+  through each Slack connector an agent can reach into a scratch channel and read the raw event with `conversations.history` (does it have `bot_id`?
+  which `user`?). If an agent-reachable connector posts as the owner, do not enable this watcher; open windows with the owner's own approval command.
 
 Footer: agent messages end `Sent by <bot> on behalf of <owner>` and never claim approval. `slack-post --approved` adds `· approved by <owner>`
 and is for a message the owner approved manually in that DM; wording that claims approval without the flag is stripped.
