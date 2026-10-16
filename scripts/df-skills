@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""df-skills — put the Dark Factory skills where Claude can use them.
+
+  df-skills list                         every skill, and whether it suits Claude chat / Cowork
+  df-skills install [--only a,b] [--dest DIR]
+                                         link the skills into Claude Code (default ~/.claude/skills)
+  df-skills zip [--set chat|all] [--only a,b] [--out DIR] [--bundle]
+                                         one zip per skill, ready to upload in Claude chat / Cowork
+                                         (Settings > Capabilities/Skills > upload a skill)
+  df-skills check                        validate every skill (name, description) without writing
+
+Python 3 standard library only. Skills are plain folders with a SKILL.md, so the
+zip carries the whole folder (scripts, references) with links followed.
+"""
+import argparse
+import os
+import re
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SKILLS = REPO / "skills"
+
+# Skills that make sense for someone who is NOT in a terminal: they turn ideas, videos and
+# results into requirements and verdicts. Everything else needs code, a cluster or the kit.
+CHAT_SET = [
+    "df-product-owner",
+    "requirements-discovery",
+    "df-qa",
+    "df-adversary-gate",
+    "df-video-intake",
+]
+
+# Words that mean "this skill expects a terminal or a tool Claude chat does not have".
+TERMINAL_HINTS = ["tmux", "kubectl", "ffmpeg", "whisper", "kit/bin", "docker", "git push", "gh pr"]
+
+DESC_LIMIT = 1024          # claude.ai skill description limit
+ZIP_WARN_MB = 25           # keep well below the upload limit
+
+
+def frontmatter(skill_md: Path):
+    text = skill_md.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.S)
+    if not m:
+        return None, text
+    fm = {}
+    for line in m.group(1).splitlines():
+        km = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
+        if km:
+            v = km.group(2).strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1].replace("''", "'")
+            fm[km.group(1)] = v
+    return fm, text
+
+
+def all_skills():
+    return sorted(p for p in SKILLS.iterdir() if (p / "SKILL.md").is_file())
+
+
+def pick(only):
+    skills = all_skills()
+    if not only:
+        return skills
+    names = {n.strip() for n in only.split(",") if n.strip()}
+    chosen = [s for s in skills if s.name in names]
+    missing = names - {s.name for s in chosen}
+    if missing:
+        sys.exit("unknown skill(s): " + ", ".join(sorted(missing)))
+    return chosen
+
+
+def problems(skill: Path):
+    out = []
+    fm, text = frontmatter(skill / "SKILL.md")
+    if fm is None:
+        return ["SKILL.md has no frontmatter (--- name / description ---)"], None
+    if fm.get("name") != skill.name:
+        out.append("frontmatter name %r does not match folder %r" % (fm.get("name"), skill.name))
+    d = fm.get("description", "")
+    if not d:
+        out.append("frontmatter has no one-line description")
+    elif len(d) > DESC_LIMIT:
+        out.append("description is %d chars (limit %d)" % (len(d), DESC_LIMIT))
+    return out, fm
+
+
+def terminal_hints(skill: Path):
+    found = set()
+    for f in skill.rglob("*"):
+        if f.is_file() and f.suffix in (".md", ".sh", ".py", ".json", ".txt"):
+            try:
+                t = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for h in TERMINAL_HINTS:
+                if h in t:
+                    found.add(h)
+    return sorted(found)
+
+
+def cmd_list(_):
+    for s in all_skills():
+        hints = terminal_hints(s)
+        tag = "chat-ready" if s.name in CHAT_SET else "code only"
+        extra = ("  needs: " + ", ".join(hints)) if hints else ""
+        print("%-32s %-10s%s" % (s.name, tag, extra))
+
+
+def cmd_check(_):
+    bad = 0
+    for s in all_skills():
+        p, _fm = problems(s)
+        for x in p:
+            print("FAIL %s: %s" % (s.name, x))
+            bad += 1
+    print("%d skills checked, %d problem(s)" % (len(all_skills()), bad))
+    return 1 if bad else 0
+
+
+def cmd_install(a):
+    dest = Path(a.dest).expanduser()
+    dest.mkdir(parents=True, exist_ok=True)
+    linked = skipped = 0
+    for s in pick(a.only):
+        target = dest / s.name
+        if target.is_symlink():
+            if target.resolve() == s.resolve():
+                skipped += 1
+                continue
+            target.unlink()                       # stale link (repo moved): repoint
+        elif target.exists():
+            print("SKIP %s: %s exists and is not a link (not touching it)" % (s.name, target))
+            skipped += 1
+            continue
+        target.symlink_to(s)
+        linked += 1
+        print("linked %s" % s.name)
+    print("done: %d linked, %d already fine or skipped -> %s" % (linked, skipped, dest))
+    print("start a NEW Claude Code session to see them (Code only; for Chat/Cowork use: df-skills zip)")
+    return 0
+
+
+def copy_clean(src: Path, dst: Path):
+    skip = {".git", "__pycache__", ".DS_Store", "node_modules"}
+    for root, dirs, files in os.walk(src, followlinks=True):
+        dirs[:] = [d for d in dirs if d not in skip]
+        rel = Path(root).relative_to(src)
+        (dst / rel).mkdir(parents=True, exist_ok=True)
+        for f in files:
+            if f in skip or f.endswith(".pyc"):
+                continue
+            shutil.copy2(Path(root) / f, dst / rel / f)
+
+
+def make_zip(skill: Path, out: Path):
+    zpath = out / (skill.name + ".zip")
+    tmp = out / ("." + skill.name + ".build")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    copy_clean(skill, tmp / skill.name)
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted((tmp / skill.name).rglob("*")):
+            if f.is_file():
+                z.write(f, f.relative_to(tmp).as_posix())    # folder name at the zip root
+    shutil.rmtree(tmp)
+    return zpath
+
+
+def cmd_zip(a):
+    out = Path(a.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    chosen = pick(a.only) if a.only else (
+        [s for s in all_skills() if s.name in CHAT_SET] if a.set == "chat" else all_skills())
+    zips, fails = [], 0
+    for s in chosen:
+        p, _fm = problems(s)
+        if p:
+            for x in p:
+                print("FAIL %s: %s" % (s.name, x))
+            fails += 1
+            continue
+        z = make_zip(s, out)
+        mb = z.stat().st_size / 1e6
+        hints = terminal_hints(s)
+        note = ("  (!) mentions " + ", ".join(hints) + ": those parts will not run in chat") if hints else ""
+        if mb > ZIP_WARN_MB:
+            note += "  (!) %.1f MB is large" % mb
+        print("zipped %-30s %.2f MB%s" % (s.name, mb, note))
+        zips.append(z)
+    if a.bundle and zips:
+        b = out / "dark-factory-skills-bundle.zip"
+        with zipfile.ZipFile(b, "w", zipfile.ZIP_STORED) as z:
+            for x in zips:
+                z.write(x, x.name)
+        print("bundle: %s (unzip it, then upload each skill zip on its own)" % b)
+    print("\nUpload: Claude (chat/Cowork) > Settings > Capabilities (Skills) > upload each .zip.")
+    print("Uploaded copies do not update themselves: re-run `df-skills zip` and re-upload after a skill changes.")
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="df-skills", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list").set_defaults(f=cmd_list)
+    sub.add_parser("check").set_defaults(f=cmd_check)
+    i = sub.add_parser("install")
+    i.add_argument("--dest", default="~/.claude/skills")
+    i.add_argument("--only")
+    i.set_defaults(f=cmd_install)
+    z = sub.add_parser("zip")
+    z.add_argument("--set", choices=["chat", "all"], default="chat")
+    z.add_argument("--only")
+    z.add_argument("--out", default="dist/skills")
+    z.add_argument("--bundle", action="store_true")
+    z.set_defaults(f=cmd_zip)
+    a = ap.parse_args()
+    sys.exit(a.f(a) or 0)
+
+
+if __name__ == "__main__":
+    main()
